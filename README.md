@@ -13,7 +13,7 @@
 <p align="center">
 
   <!-- ▶ LIVE APP — one click to open the deployed Streamlit app -->
-  <a href="https://indian-forest-phenology-v6.streamlit.app/" target="_blank">
+  <a href="https://phenologyassessment-je2iv3fee8notrbdo4jnim.streamlit.app" target="_blank">
     <img src="https://img.shields.io/badge/▶%20Open%20Live%20App-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" alt="Open Live App" />
   </a>
 
