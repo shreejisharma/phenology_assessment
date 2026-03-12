@@ -1,16 +1,38 @@
 """
-Universal Indian Forest Phenology Predictor — v5.1
+Universal Indian Forest Phenology Predictor — v5.3
 100% Data-Driven | All Indian Forest Types
 Author: Sharma, S. (2025)
 
-v5.1 corrections:
+v5.3 changes (current):
+  - NDVI always interpolated to fixed 5-day grid before SG smoothing
+    (regardless of original sensor cadence — MODIS 8/16-day, Sentinel-2 10-day, etc.)
+  - SG window operates on 5-day steps (31 steps ≈ 155 days max)
+  - Sidebar: Met window range changed to 5–30 days (was 15–90)
+  - Sidebar: SOS/EOS threshold default changed to 10% (was 25%)
+  - Annual NDVI+Met plot: shows 5-day smooth + raw scatter + per-year threshold
+    line + all available NASA POWER variables with colour-coded legend
+  - Technical Guide updated to document all v5.x fixes
+
+v5.2 changes:
+  - Per-cycle adaptive threshold: each season uses its own local vmin/vmax
+    → low-amplitude years (dry/El Niño) no longer silently skipped
+  - Fallback crossing logic: plateau-top cycles without strict up/down crossing
+    fall back to first/last point above threshold
+  - Multi-pass trough detection: strict → relaxed distance → last resort
+  - Overview plot: per-cycle threshold drawn as dotted orange horizontal line
+  - Trough markers (▼) shown on overview plot
+
+v5.1 changes:
   - NASA POWER loader: robust multi-format header detection (YEAR/DOY, MO/DY,
-    -BEGIN HEADER- block, comment '#' lines, blank lines, pipe-delimited NASA
-    POWER legacy format)
-  - LOESS model re-added (statsmodels lowess fallback to Ridge if unavailable)
-  - T2M_RANGE derived feature added  (T2M_MAX – T2M_MIN, distinct from DTR)
-  - Threshold definition kept exactly as v5 (first/last amplitude crossing)
+    -BEGIN HEADER- block, comment '#' lines, blank lines)
+  - LOESS model re-added (statsmodels lowess, fallback to Ridge if unavailable)
+  - T2M_RANGE derived feature added (T2M_MAX – T2M_MIN)
   - sample_nasa_power_met.csv generator updated to emit true NASA POWER format
+
+v5.0 (original):
+  - 100% data-driven — no hardcoded forest-type presets
+  - Cadence, gap threshold, trough distance, amplitude all from data
+  - Ridge / Polynomial / GPR models with LOO cross-validation
 """
 
 import warnings
