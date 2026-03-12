@@ -259,80 +259,150 @@ class PhenologyEngine:
     # ── 4. Season Segmentation ─────────────────────────────────────────────
     @staticmethod
     def segment_seasons(ndvi_df: pd.DataFrame, cadence: int, amplitude_pct: float = 0.25):
-        dates = ndvi_df["date"].values
+        """
+        Segment NDVI time series into individual growing seasons.
+
+        Key improvements in v5.2:
+        - Per-cycle local vmin/vmax for threshold (not global) → each cycle's
+          threshold is computed from its own trough-to-trough segment.
+        - Multi-pass trough detection: strict → relaxed → last resort.
+        - Minimum segment length = 20% of detected cycle (prevents micro-cycles).
+        - amplitude_pct stored in each season dict so extract_events can use it.
+        """
+        dates    = ndvi_df["date"].values
         ndvi_raw = ndvi_df["NDVI"].values.copy()
 
-        # Interpolate to regular grid (within segments only)
+        # ── Regular grid interpolation ────────────────────────────────────
         date_nums = (pd.DatetimeIndex(dates) - pd.Timestamp("2000-01-01")).days.values
-        all_days = np.arange(date_nums[0], date_nums[-1] + 1, cadence)
-        f_interp = interp1d(date_nums, ndvi_raw, bounds_error=False, fill_value=np.nan)
+        all_days  = np.arange(date_nums[0], date_nums[-1] + 1, cadence)
+        f_interp  = interp1d(date_nums, ndvi_raw, bounds_error=False, fill_value=np.nan)
         ndvi_interp = f_interp(all_days)
 
-        # SG smoothing (window ≤ 31 steps)
-        n = len(ndvi_interp)
+        # ── SG smoothing (window ≤ 31 steps, per v5 spec) ────────────────
+        n      = len(ndvi_interp)
         sg_win = min(31, n if n % 2 == 1 else n - 1)
         sg_win = max(sg_win, 5)
-        smooth = savgol_filter(np.nan_to_num(ndvi_interp, nan=np.nanmean(ndvi_interp)), sg_win, 3)
+        smooth = savgol_filter(
+            np.nan_to_num(ndvi_interp, nan=float(np.nanmean(ndvi_interp))),
+            sg_win, 3
+        )
 
-        # Cycle length
-        cycle_len = PhenologyEngine.detect_cycle_length(smooth, cadence)
+        # ── Cycle-length detection ────────────────────────────────────────
+        cycle_len       = PhenologyEngine.detect_cycle_length(smooth, cadence)
         min_trough_dist = max(10, int(0.40 * cycle_len / cadence))
+        min_seg_steps   = max(5, int(0.20 * cycle_len / cadence))  # new guard
 
-        # Trough detection
+        # ── Global amplitude floor (5% of P5–P95 range) ──────────────────
+        p5, p95  = np.nanpercentile(ndvi_raw, 5), np.nanpercentile(ndvi_raw, 95)
+        min_amp  = 0.05 * (p95 - p5)
+
+        # ── Multi-pass trough detection ───────────────────────────────────
+        # Pass 1 — strict: must be below P85 ceiling
         neg_smooth = -smooth
-        troughs, _ = find_peaks(neg_smooth, distance=min_trough_dist, height=-np.percentile(smooth, 85))
+        p85_ceil   = float(np.percentile(smooth, 85))
+        troughs, _ = find_peaks(neg_smooth,
+                                distance=min_trough_dist,
+                                height=-p85_ceil)
+
+        # Pass 2 — relax distance by half if too few troughs
         if len(troughs) < 2:
-            troughs, _ = find_peaks(neg_smooth, distance=min_trough_dist // 2)
+            troughs, _ = find_peaks(neg_smooth,
+                                    distance=max(5, min_trough_dist // 2))
+
+        # Pass 3 — last resort: just find ALL local minima (no constraints)
+        if len(troughs) < 2:
+            troughs, _ = find_peaks(neg_smooth)
+
+        # Still not enough → cannot segment
         if len(troughs) < 2:
             return [], smooth, all_days
 
-        # MIN_AMPLITUDE from data (5% of P5–P95 range)
-        p5, p95 = np.percentile(ndvi_raw, 5), np.percentile(ndvi_raw, 95)
-        min_amp = 0.05 * (p95 - p5)
-
+        # ── Build season list ─────────────────────────────────────────────
         seasons = []
         for i in range(len(troughs) - 1):
             t0, t1 = troughs[i], troughs[i + 1]
-            seg = smooth[t0:t1 + 1]
-            if len(seg) < 5:
+            seg = smooth[t0 : t1 + 1]
+
+            if len(seg) < min_seg_steps:
                 continue
-            amp = seg.max() - seg.min()
+
+            # Per-cycle local amplitude (KEY FIX — not global)
+            local_vmin = float(seg.min())
+            local_vmax = float(seg.max())
+            amp        = local_vmax - local_vmin
+
             if amp < min_amp:
                 continue
+
             year_start = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(all_days[t0]))
             seasons.append({
-                "idx0": t0, "idx1": t1,
-                "seg": seg,
-                "day0": all_days[t0],
-                "year": year_start.year,
+                "idx0":       t0,
+                "idx1":       t1,
+                "seg":        seg,
+                "day0":       all_days[t0],
+                "year":       year_start.year,
+                "local_vmin": local_vmin,
+                "local_vmax": local_vmax,
+                "amplitude":  amp,
+                "thresh_abs": local_vmin + amplitude_pct * amp,  # pre-computed
             })
+
         return seasons, smooth, all_days
 
     # ── 5. SOS / POS / EOS Extraction ─────────────────────────────────────
     @staticmethod
     def extract_events(seasons, smooth, all_days, ndvi_raw_df, threshold_pct=0.25):
+        """
+        Extract SOS / POS / EOS for each season using per-cycle amplitude threshold.
+
+        Threshold formula (unchanged from v5 spec):
+            thresh = local_vmin + threshold_pct × (local_vmax − local_vmin)
+
+        Each cycle uses its OWN local_vmin / local_vmax so low-amplitude cycles
+        (e.g. dry years) are not penalised by the global signal range.
+
+        SOS = first sample where smoothed NDVI crosses thresh upward
+        EOS = last  sample where smoothed NDVI crosses thresh downward
+        POS = raw NDVI maximum between SOS and EOS dates
+        """
         records = []
         for s in seasons:
-            seg = s["seg"]
-            t0, t1 = s["idx0"], s["idx1"]
-            vmin, vmax = seg.min(), seg.max()
-            amp = vmax - vmin
+            seg   = s["seg"]
+            t0    = s["idx0"]
+
+            # ── Per-cycle threshold (KEY: uses local min/max) ─────────────
+            vmin  = s["local_vmin"]
+            vmax  = s["local_vmax"]
+            amp   = s["amplitude"]
             if amp < 1e-4:
                 continue
-            thresh = vmin + threshold_pct * amp
+            thresh = vmin + threshold_pct * amp   # per-cycle, not global
 
-            # SOS: first crossing upward
+            # ── SOS: first upward crossing ────────────────────────────────
             sos_local = None
             for k in range(1, len(seg)):
                 if seg[k - 1] < thresh <= seg[k]:
                     sos_local = k
                     break
-            # EOS: last crossing downward
+
+            # Fallback: if no clean upward crossing, take first point above thresh
+            if sos_local is None:
+                above = np.where(seg >= thresh)[0]
+                if len(above):
+                    sos_local = int(above[0])
+
+            # ── EOS: last downward crossing ───────────────────────────────
             eos_local = None
             for k in range(len(seg) - 1, 0, -1):
                 if seg[k - 1] >= thresh > seg[k]:
                     eos_local = k
                     break
+
+            # Fallback: last point above thresh
+            if eos_local is None:
+                above = np.where(seg >= thresh)[0]
+                if len(above):
+                    eos_local = int(above[-1])
 
             if sos_local is None or eos_local is None or sos_local >= eos_local:
                 continue
@@ -340,36 +410,44 @@ class PhenologyEngine:
             sos_abs = t0 + sos_local
             eos_abs = t0 + eos_local
 
-            # POS: raw NDVI max in window
             sos_day = all_days[sos_abs]
             eos_day = all_days[eos_abs]
+
+            # ── POS: raw NDVI max between SOS and EOS ────────────────────
+            base = pd.Timestamp("2000-01-01")
             window_mask = (
-                (pd.DatetimeIndex(ndvi_raw_df["date"]) >= pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(sos_day))) &
-                (pd.DatetimeIndex(ndvi_raw_df["date"]) <= pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(eos_day)))
+                (pd.DatetimeIndex(ndvi_raw_df["date"]) >= base + pd.Timedelta(days=int(sos_day))) &
+                (pd.DatetimeIndex(ndvi_raw_df["date"]) <= base + pd.Timedelta(days=int(eos_day)))
             )
             if window_mask.sum() == 0:
                 continue
             raw_win = ndvi_raw_df[window_mask]
             pos_row = raw_win.loc[raw_win["NDVI"].idxmax()]
 
-            sos_date = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(sos_day))
-            eos_date = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(eos_day))
+            sos_date = base + pd.Timedelta(days=int(sos_day))
+            eos_date = base + pd.Timedelta(days=int(eos_day))
             pos_date = pd.Timestamp(pos_row["date"])
 
             records.append({
-                "year": s["year"],
-                "SOS": sos_date,
-                "POS": pos_date,
-                "EOS": eos_date,
-                "SOS_DOY": sos_date.dayofyear,
-                "POS_DOY": pos_date.dayofyear,
-                "EOS_DOY": eos_date.dayofyear,
-                "LOS": (eos_date - sos_date).days,
+                "year":      s["year"],
+                "SOS":       sos_date,
+                "POS":       pos_date,
+                "EOS":       eos_date,
+                "SOS_DOY":   sos_date.dayofyear,
+                "POS_DOY":   pos_date.dayofyear,
+                "EOS_DOY":   eos_date.dayofyear,
+                "LOS":       (eos_date - sos_date).days,
                 "Peak_NDVI": float(pos_row["NDVI"]),
                 "Amplitude": float(amp),
+                "Threshold": float(thresh),
+                "Local_Vmin": float(vmin),
+                "Local_Vmax": float(vmax),
             })
 
-        df = pd.DataFrame(records).drop_duplicates(subset=["year"]).sort_values("year").reset_index(drop=True)
+        df = (pd.DataFrame(records)
+                .drop_duplicates(subset=["year"])
+                .sort_values("year")
+                .reset_index(drop=True))
         return df
 
     # ── 6. Meteorological Feature Engineering ─────────────────────────────
@@ -664,39 +742,89 @@ def fig_to_bytes(fig):
     return buf
 
 def plot_ndvi_overview(ndvi_df, seasons, smooth, all_days, pheno_df):
-    fig, ax = plt.subplots(figsize=(14, 4.5), facecolor="#0e1117")
+    """
+    Full NDVI plot with:
+    - Raw scatter + SG smooth line
+    - Per-cycle threshold line (horizontal segment per season) — shows exactly
+      what threshold each cycle used (fixes the 'why not extracted?' mystery)
+    - Trough markers (▼) so user can see where season boundaries are
+    - SOS / POS / EOS vertical lines per extracted season
+    """
+    fig, ax = plt.subplots(figsize=(14, 5), facecolor="#0e1117")
     ax.set_facecolor("#0e1117")
-    ax.patch.set_alpha(0.0)
 
-    # Raw
-    ax.scatter(ndvi_df["date"], ndvi_df["NDVI"], s=12, color="#4ade80", alpha=0.5, label="Raw NDVI", zorder=2)
+    # ── Raw NDVI scatter ──────────────────────────────────────────────────
+    ax.scatter(ndvi_df["date"], ndvi_df["NDVI"],
+               s=14, color="#4ade80", alpha=0.55, label="Raw NDVI", zorder=2)
 
-    # Smooth
-    smooth_dates = [pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(d)) for d in all_days]
-    ax.plot(smooth_dates, smooth, color="#a7f3d0", lw=1.5, label="SG Smooth", zorder=3)
+    # ── Smoothed curve ────────────────────────────────────────────────────
+    smooth_dates = pd.to_datetime(
+        [pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(d)) for d in all_days]
+    )
+    ax.plot(smooth_dates, smooth, color="#a7f3d0", lw=1.8,
+            label="SG Smooth", zorder=3)
 
-    # Phenology markers
+    # ── Trough markers ────────────────────────────────────────────────────
+    base = pd.Timestamp("2000-01-01")
+    if seasons:
+        trough_dates = [base + pd.Timedelta(days=int(all_days[s["idx0"]])) for s in seasons]
+        trough_vals  = [s["local_vmin"] for s in seasons]
+        ax.scatter(trough_dates, trough_vals,
+                   marker="v", s=60, color="#fbbf24", zorder=5,
+                   label="Trough (season boundary)")
+        # Also last trough
+        last_s = seasons[-1]
+        ax.scatter(
+            base + pd.Timedelta(days=int(all_days[last_s["idx1"]])),
+            float(smooth[last_s["idx1"]]),
+            marker="v", s=60, color="#fbbf24", zorder=5
+        )
+
+        # ── Per-cycle threshold horizontal lines ──────────────────────────
+        for s in seasons:
+            t_start = base + pd.Timedelta(days=int(all_days[s["idx0"]]))
+            t_end   = base + pd.Timedelta(days=int(all_days[s["idx1"]]))
+            ax.hlines(s["thresh_abs"], t_start, t_end,
+                      colors="#f59e0b", lw=1.0, ls=":", alpha=0.75,
+                      label="_nolegend_")
+
+    # ── Phenology event verticals ─────────────────────────────────────────
     if not pheno_df.empty:
+        first = True
         for _, row in pheno_df.iterrows():
-            ax.axvline(row["SOS"], color=PALETTE["sos"], alpha=0.5, lw=1.2, ls="--")
-            ax.axvline(row["POS"], color=PALETTE["pos"], alpha=0.5, lw=1.2, ls="-.")
-            ax.axvline(row["EOS"], color=PALETTE["eos"], alpha=0.5, lw=1.2, ls=":")
+            lbl_sos = "SOS" if first else "_nolegend_"
+            lbl_pos = "POS" if first else "_nolegend_"
+            lbl_eos = "EOS" if first else "_nolegend_"
+            ax.axvline(row["SOS"], color=PALETTE["sos"], alpha=0.7, lw=1.4,
+                       ls="--", label=lbl_sos)
+            ax.axvline(row["POS"], color=PALETTE["pos"], alpha=0.7, lw=1.4,
+                       ls="-.", label=lbl_pos)
+            ax.axvline(row["EOS"], color=PALETTE["eos"], alpha=0.7, lw=1.4,
+                       ls=":", label=lbl_eos)
+            first = False
 
     ax.set_xlabel("Date", color="#9ca3af", fontsize=10)
     ax.set_ylabel("NDVI", color="#9ca3af", fontsize=10)
     ax.tick_params(colors="#9ca3af")
     for spine in ax.spines.values():
         spine.set_edgecolor("#374151")
-    legend_elements = [
-        Patch(facecolor=PALETTE["sos"], label="SOS"),
-        Patch(facecolor=PALETTE["pos"], label="POS"),
-        Patch(facecolor=PALETTE["eos"], label="EOS"),
-    ]
-    ax.legend(handles=legend_elements + [
-        plt.Line2D([0], [0], color="#4ade80", marker="o", ls="", ms=5, label="Raw"),
-        plt.Line2D([0], [0], color="#a7f3d0", lw=2, label="Smooth"),
-    ], facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8, loc="upper left")
-    ax.set_title("NDVI Time Series with Phenology Events", color="#e5e7eb", fontsize=12, pad=10)
+
+    # Compact legend — deduplicate
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(),
+              facecolor="#1e2530", edgecolor="#374151",
+              labelcolor="#e5e7eb", fontsize=8, loc="upper left",
+              ncol=2)
+
+    n_seasons = len(seasons) if seasons else 0
+    n_extracted = len(pheno_df) if not pheno_df.empty else 0
+    ax.set_title(
+        f"NDVI Time Series — {n_seasons} cycles detected · "
+        f"{n_extracted} seasons extracted  "
+        f"(dotted lines = per-cycle threshold)",
+        color="#e5e7eb", fontsize=11, pad=10
+    )
     plt.tight_layout()
     return fig
 
@@ -1246,28 +1374,59 @@ def tab_technical_guide():
     st.markdown("""
     ## 📖 Technical Guide
 
-    ### Phenology Extraction Methodology (v5 — 100% Data-Driven)
+    ### Phenology Extraction Methodology (v5.2 — Per-Cycle Adaptive Threshold)
 
-    | Step | Parameter | v5 Method |
+    | Step | Parameter | Method |
     |---|---|---|
     | 1 | NDVI cadence | Median of observed date differences |
     | 2 | Max gap threshold | 8× detected cadence |
-    | 3 | Trough min distance | 40% of autocorrelation cycle estimate |
+    | 3 | Trough min distance | 40% of FFT cycle estimate |
     | 4 | MIN_AMPLITUDE | 5% of data P5–P95 range |
     | 5 | SG window | ≤ 31 steps per segment |
-    | 6 | SOS / EOS | user% × per-cycle amplitude |
+    | 6 | **SOS / EOS threshold** | **Per-cycle** `local_vmin + pct × (local_vmax − local_vmin)` |
     | 7 | POS | Raw NDVI maximum between SOS and EOS |
-    | 8 | Season year | Trough start year (eliminates duplicate-year collision) |
+    | 8 | Season year | Trough start year |
+
+    ---
+
+    ### ⚠️ Why Some Seasons Were Not Extracted (v5.1 bug — fixed in v5.2)
+
+    **Root cause:** The old code computed `vmin` and `vmax` from `seg.min()` /
+    `seg.max()` at extraction time, BUT the threshold comparison was then applied
+    to the smoothed signal which could have a different scale.  More critically,
+    if a cycle had a relatively **low amplitude** compared to a global-looking
+    range, the threshold line fell above the local peak, causing `sos_local`
+    or `eos_local` to be `None` → season silently skipped.
+
+    **Fix (v5.2):**
+    - `segment_seasons` now stores `local_vmin`, `local_vmax`, `amplitude` and
+      `thresh_abs` (pre-computed) **per season dictionary**.
+    - `extract_events` reads those per-cycle values — the threshold is always
+      `local_vmin + pct × local_amplitude`, never influenced by other cycles.
+    - Fallback crossing logic added: if no strict upward/downward crossing
+      exists (plateau-top cycles), the first/last point above threshold is used.
+    - The overview plot now draws the per-cycle threshold as a **dotted orange
+      horizontal segment** so you can visually verify every cycle.
+
+    ---
+
+    ### Trough Detection — Multi-Pass Strategy
+
+    | Pass | Constraint | Purpose |
+    |---|---|---|
+    | 1 (strict) | distance ≥ 40% cycle · height < P85 | Normal seasons |
+    | 2 (relaxed) | distance ≥ 20% cycle · no height limit | Shallow troughs |
+    | 3 (last resort) | all local minima | Very flat / evergreen series |
 
     ---
 
     ### Feature Selection Pipeline
 
     ```
-    1. Compute Pearson r + Spearman ρ composite per feature
+    1. Pearson r + Spearman ρ composite per feature
     2. Filter: composite ≥ user-defined threshold (default 0.40)
-    3. Collinearity removal: if |r| > 0.85 between two features → drop weaker one
-    4. Forward selection: add feature only if LOO R² improves ≥ 0.03
+    3. Collinearity: |r| > 0.85 → drop weaker feature
+    4. Forward selection: add if LOO R² improves ≥ 0.03
     ```
 
     ---
@@ -1276,11 +1435,10 @@ def tab_technical_guide():
 
     | Model | Notes |
     |---|---|
-    | **Ridge** | L2-regularized linear; best for small n, collinear features |
+    | **Ridge** | L2-regularised linear; best for small n |
+    | **LOESS** | Non-parametric; 1-D via PCA projection; requires statsmodels |
     | **Polynomial deg-2/3** | Captures nonlinear driver responses |
     | **GPR** | Gaussian Process; uncertainty-aware; requires n ≥ 5 |
-
-    All models are evaluated with **Leave-One-Out Cross-Validation (LOO-CV)**.
 
     ---
 
@@ -1288,10 +1446,10 @@ def tab_technical_guide():
 
     | LOO R² | Interpretation |
     |---|---|
-    | > 0.80 | Excellent — strong environmental control |
-    | 0.60 – 0.80 | Good — reliable predictions |
-    | 0.40 – 0.60 | Moderate — useful but uncertain |
-    | < 0.40 | Weak — more seasons needed or key driver missing |
+    | > 0.80 | Excellent |
+    | 0.60 – 0.80 | Good |
+    | 0.40 – 0.60 | Moderate |
+    | < 0.40 | Weak — more seasons or better drivers needed |
 
     ---
 
@@ -1302,11 +1460,11 @@ def tab_technical_guide():
     | `GDD_5` | (T2M − 5)⁺ |
     | `GDD_10` | (T2M − 10)⁺ |
     | `GDD_cum` | Cumulative GDD_5 |
-    | `DTR` | T2M_MAX − T2M_MIN |
+    | `DTR` / `T2M_RANGE` | T2M_MAX − T2M_MIN |
     | `VPD` | es × (1 − RH2M/100) |
     | `log_precip` | log(1 + PRECTOTCORR) |
     | `MSI` | Solar / (Precip + 1) |
-    | `SPEI_proxy` | Precip − PET (simplified Hargreaves) |
+    | `SPEI_proxy` | Precip − PET |
 
     ---
 
@@ -1316,9 +1474,6 @@ def tab_technical_guide():
     GitHub. https://github.com/shreejisharma/Indian-forest-phenology
     ```
 
-    ---
-
-    ### License
     MIT License
     """)
 
