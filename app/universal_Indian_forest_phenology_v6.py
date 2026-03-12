@@ -1,1096 +1,1170 @@
 """
-Universal Indian Forest Phenology Predictor — v6
-=================================================
-KEY IMPROVEMENTS over v5:
-  1. Monsoon-aware feature engineering  — PRECTOTCORR sum windows (not just mean)
-  2. Causal collinearity resolution     — moisture features protected from T2M suppression
-  3. Variable window optimization       — auto-selects 15/30/60/90d per event
-  4. GDD_cum data-leakage guard         — flagged and excluded from forward selection
-  5. Variance-weighted feature ranking  — low-variation features (T2M ≈0.67°C) down-ranked
-  6. Transparent driver diagnosis panel — shows WHY T2M was/was not selected
-  7. Monsoon onset index                — custom feature for Indian forest phenology
+Universal Indian Forest Phenology Predictor — v5
+100% Data-Driven | All Indian Forest Types
+Author: Sharma, S. (2025)
 """
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_filter, find_peaks
 from scipy.stats import pearsonr, spearmanr
 from scipy.interpolate import interp1d
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+from sklearn.metrics import r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import warnings, io, datetime
-warnings.filterwarnings("ignore")
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import Patch
+import io
+import re
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+# ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="🌲 Indian Forest Phenology v6",
+    page_title="Indian Forest Phenology Predictor v5",
     page_icon="🌲",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── Custom CSS ───────────────────────────────────────────────────────────────
+# ── CUSTOM CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.main { background: #f8fafb; }
-.stTabs [data-baseweb="tab-list"] { gap: 6px; }
-.stTabs [data-baseweb="tab"] { padding: 8px 18px; border-radius: 8px 8px 0 0; font-weight: 600; }
-.metric-card { background: white; border-radius: 10px; padding: 16px 20px;
-               box-shadow: 0 1px 6px rgba(0,0,0,0.08); border-left: 4px solid; margin-bottom: 10px; }
-.driver-good { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px 14px; }
-.driver-warn { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 14px; }
-.driver-bad  { background: #fff1f2; border: 1px solid #fecdd3; border-radius: 8px; padding: 10px 14px; }
-.eq-box { background: #1e1e2e; color: #cdd6f4; font-family: monospace; font-size: 13px;
-          border-radius: 8px; padding: 14px 18px; margin: 10px 0; border-left: 4px solid #89b4fa; }
-.warn-box { background: #fff7ed; border: 1px solid #fdba74; border-radius: 8px;
-            padding: 12px 16px; font-size: 13px; margin: 8px 0; }
+    .main { background-color: #0e1117; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #1e2530;
+        border-radius: 8px 8px 0 0;
+        padding: 8px 20px;
+        color: #9ca3af;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #22c55e !important;
+        color: #000 !important;
+    }
+    .metric-card {
+        background: #1e2530;
+        border: 1px solid #374151;
+        border-radius: 10px;
+        padding: 16px;
+        margin: 6px 0;
+    }
+    .highlight-box {
+        background: linear-gradient(135deg, #14532d, #1a2535);
+        border: 1px solid #22c55e;
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin: 10px 0;
+    }
+    .section-header {
+        font-size: 1.1rem;
+        font-weight: 700;
+        color: #22c55e;
+        border-bottom: 1px solid #374151;
+        padding-bottom: 6px;
+        margin: 18px 0 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PHENOLOGY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-def detect_cadence(dates):
-    diffs = np.diff(sorted(dates)).astype("timedelta64[D]").astype(float)
-    return float(np.median(diffs))
+class PhenologyEngine:
+    """Fully data-driven phenology extraction and regression engine."""
 
-def smooth_ndvi(vals, window_steps=7):
-    wl = min(window_steps, len(vals))
-    if wl % 2 == 0: wl -= 1
-    if wl < 3: return vals.copy()
-    try:    return savgol_filter(vals, window_length=wl, polyorder=2)
-    except: return vals.copy()
+    # ── 1. NDVI Loading & Cleaning ─────────────────────────────────────────
+    @staticmethod
+    def load_ndvi(uploaded_file) -> pd.DataFrame:
+        df = pd.read_csv(uploaded_file)
+        df.columns = [c.strip().lower() for c in df.columns]
+        date_col = next((c for c in df.columns if "date" in c or "time" in c), df.columns[0])
+        ndvi_col = next((c for c in df.columns if "ndvi" in c), df.columns[1])
+        df = df[[date_col, ndvi_col]].rename(columns={date_col: "date", ndvi_col: "NDVI"})
+        df["date"] = pd.to_datetime(df["date"], infer_datetime_format=True, errors="coerce")
+        df = df.dropna(subset=["date", "NDVI"]).sort_values("date").reset_index(drop=True)
+        df["NDVI"] = pd.to_numeric(df["NDVI"], errors="coerce")
+        df = df.dropna(subset=["NDVI"])
+        df["NDVI"] = df["NDVI"].clip(0, 1)
+        return df
 
-def extract_phenology(subdf, threshold_pct=0.20):
-    sub = subdf.sort_values("Date").reset_index(drop=True)
-    ndvi_raw  = sub["NDVI"].values
-    dates     = pd.to_datetime(sub["Date"].values)
-    smooth    = smooth_ndvi(ndvi_raw)
-
-    p5, p95 = np.percentile(smooth, 5), np.percentile(smooth, 95)
-    amp = p95 - p5
-    if amp < 0.02:
-        return None
-    thr = p5 + threshold_pct * amp
-
-    pi = np.argmax(smooth)
-    pos_date  = dates[pi]
-    peak_ndvi = float(ndvi_raw[pi])   # raw peak (v5 fix)
-
-    # SOS — first upward crossing before peak
-    sos_date = None
-    for i in range(1, pi + 1):
-        if smooth[i - 1] < thr <= smooth[i]:
-            sos_date = dates[i]; break
-    if sos_date is None:
-        for i in range(pi + 1):
-            if smooth[i] >= thr:
-                sos_date = dates[i]; break
-
-    # EOS — last value above threshold after peak
-    eos_date = None
-    for i in range(len(smooth) - 1, pi - 1, -1):
-        if smooth[i] >= thr:
-            eos_date = dates[i]; break
-
-    los = (eos_date - sos_date).days if (sos_date is not None and eos_date is not None) else None
-
-    return {
-        "SOS_date": sos_date, "SOS_DOY": int(sos_date.dayofyear) if sos_date else None,
-        "POS_date": pos_date, "POS_DOY": int(pos_date.dayofyear),
-        "EOS_date": eos_date, "EOS_DOY": int(eos_date.dayofyear) if eos_date else None,
-        "LOS": los, "PeakNDVI": round(peak_ndvi, 4),
-        "amplitude": round(float(amp), 4), "smooth": smooth, "dates": dates,
-    }
-
-def assign_season(date):
-    """Hydrological year: season starts May 1"""
-    return date.year - 1 if date.month < 5 else date.year
-
-# ─── Feature engineering ─────────────────────────────────────────────────────
-def engineer_features(df):
-    df = df.copy()
-    df["GDD_5"]      = np.maximum(0, df["T2M"] - 5)
-    df["GDD_10"]     = np.maximum(0, df["T2M"] - 10)
-    df["DTR"]        = df["T2M_MAX"] - df["T2M_MIN"]
-    df["log_precip"] = np.log1p(df["PRECTOTCORR"])
-    df["VPD"]        = df.get("VPD", df["T2M"] * 0.06)  # fallback if missing
-    df["SPEI_proxy"] = (df["PRECTOTCORR"] - df["T2M"]) / (df["T2M"].abs() + 1)
-    df["MSI"]        = df["ALLSKY_SFC_SW_DWN"] / (df["PRECTOTCORR"] + 1)
-    df["T2M_RANGE"]  = df["T2M_MAX"] - df["T2M_MIN"]
-    df["Season"]     = df["Date"].apply(assign_season)
-    df["GDD_cum"]    = df.groupby("Season")["GDD_5"].cumsum()
-    # Monsoon onset index: rolling 30d precipitation anomaly
-    df["precip_roll30"]  = df["PRECTOTCORR"].rolling(6, min_periods=1).sum()
-    df["precip_roll90"]  = df["PRECTOTCORR"].rolling(18, min_periods=1).sum()
-    return df
-
-# ─── Met window extractor ─────────────────────────────────────────────────────
-def met_window_features(df, event_date, window_days, event_type="SOS"):
-    """
-    Extract ecologically meaningful features in a window before the event.
-    v6 improvement: uses SUM for precipitation (not mean), multiple windows,
-    and adds monsoon-specific derived features.
-    """
-    if event_date is None:
-        return {}
-    t0   = pd.Timestamp(event_date)
-    mask = (df["Date"] >= t0 - pd.Timedelta(days=window_days)) & (df["Date"] < t0)
-    sub  = df[mask]
-    if len(sub) == 0:
-        return {}
-
-    feats = {}
-    # ── Thermal (mean — small variation in tropical sites) ──
-    for col in ["T2M", "T2M_MAX", "T2M_MIN", "DTR", "T2M_RANGE"]:
-        if col in sub:
-            feats[col] = round(float(sub[col].mean()), 4)
-
-    # ── Moisture (SUM for precip = physically meaningful accumulation) ──
-    if "PRECTOTCORR" in sub:
-        feats["PRECTOTCORR_sum"]  = round(float(sub["PRECTOTCORR"].sum()), 2)
-        feats["PRECTOTCORR_mean"] = round(float(sub["PRECTOTCORR"].mean()), 4)
-    if "RH2M" in sub:
-        feats["RH2M"]  = round(float(sub["RH2M"].mean()), 4)
-    if "VPD" in sub:
-        feats["VPD"]   = round(float(sub["VPD"].mean()), 4)
-    if "SPEI_proxy" in sub:
-        feats["SPEI_proxy"] = round(float(sub["SPEI_proxy"].mean()), 4)
-    if "log_precip" in sub:
-        feats["log_precip"] = round(float(sub["log_precip"].mean()), 4)
-    if "MSI" in sub:
-        feats["MSI"]   = round(float(sub["MSI"].mean()), 4)
-
-    # ── Wind & Radiation ──
-    if "WS2M" in sub:
-        feats["WS2M"]  = round(float(sub["WS2M"].mean()), 4)
-    if "ALLSKY_SFC_SW_DWN" in sub:
-        feats["ALLSKY_SFC_SW_DWN"] = round(float(sub["ALLSKY_SFC_SW_DWN"].mean()), 4)
-
-    # ── GDD (sum = heat accumulation) ──
-    if "GDD_5" in sub:
-        feats["GDD_5_sum"]  = round(float(sub["GDD_5"].sum()), 2)
-        feats["GDD_5"]      = round(float(sub["GDD_5"].mean()), 4)
-    if "GDD_10" in sub:
-        feats["GDD_10_sum"] = round(float(sub["GDD_10"].sum()), 2)
-        feats["GDD_10"]     = round(float(sub["GDD_10"].mean()), 4)
-
-    # ── GDD_cum: flag as potential data-leakage ──
-    if "GDD_cum" in sub:
-        feats["GDD_cum__LEAKAGE_RISK"] = round(float(sub["GDD_cum"].mean()), 4)
-
-    return feats
-
-# ─── Feature selection (v6 — variance-weighted, causal priority) ──────────────
-LEAKAGE_FEATURES   = {"GDD_cum__LEAKAGE_RISK"}
-LOW_VARIATION_WARN = {"T2M", "T2M_MAX", "T2M_MIN"}   # warn if CV < 2%
-
-def select_features(X, y, feature_names, pearson_threshold=0.40,
-                    collinearity_threshold=0.85, loo_improvement=0.03,
-                    protect_moisture=True):
-    """
-    v6 feature selection:
-    1. Compute Pearson |r| and Spearman |ρ| composite
-    2. Flag leakage features (excluded)
-    3. Variance-weight: if CV < 2%, composite × 0.5 (down-rank stable features)
-    4. Collinearity filter: BUT moisture features are protected if they are
-       more correlated with target than T2M
-    5. Forward LOO R² selection
-    """
-    n = len(y)
-    composites = {}
-    directions = {}
-    warns      = {}
-    for i, f in enumerate(feature_names):
-        x = X[:, i]
-        if np.std(x) == 0:
-            composites[f] = 0; continue
-        r_p, _ = pearsonr(x, y)
-        r_s, _ = spearmanr(x, y)
-        comp   = (abs(r_p) + abs(r_s)) / 2
-        # Variance weight: down-rank features with very small CV
-        cv = abs(np.std(x) / (np.mean(x) + 1e-9))
-        if cv < 0.02 and f in LOW_VARIATION_WARN:
-            comp *= 0.5
-            warns[f] = f"Low CV ({cv*100:.1f}%) — may be noise, not signal"
-        if f in LEAKAGE_FEATURES:
-            comp = -1
-            warns[f] = "Excluded: potential data-leakage (GDD_cum computed within same season)"
-        composites[f] = round(comp, 4)
-        directions[f] = "+" if r_p >= 0 else "-"
-
-    # Filter threshold
-    candidates = [f for f, c in composites.items() if c >= pearson_threshold]
-    # Rank by composite
-    candidates.sort(key=lambda f: -composites[f])
-
-    # Collinearity filter — v6: moisture features protected
-    selected = []
-    role     = {f: "Below threshold" for f in feature_names}
-    for f in feature_names:
-        if composites.get(f, 0) < pearson_threshold:
-            role[f] = "Below threshold"
-    for f in LEAKAGE_FEATURES:
-        if f in role: role[f] = "⚠️ Excluded — data-leakage risk"
-
-    kept = []
-    moisture_keys = {"PRECTOTCORR_sum", "PRECTOTCORR_mean", "RH2M", "SPEI_proxy", "log_precip"}
-    for f in candidates:
-        redundant = False
-        for k in kept:
-            xi  = X[:, feature_names.index(f)]
-            xk  = X[:, feature_names.index(k)]
-            if np.std(xi) > 0 and np.std(xk) > 0:
-                r, _ = pearsonr(xi, xk)
-                if abs(r) > collinearity_threshold:
-                    # v6 protection: prefer moisture over T2M for monsoon sites
-                    if protect_moisture and f in moisture_keys and k in LOW_VARIATION_WARN:
-                        kept.remove(k)
-                        role[k] = f"Replaced by {f} (moisture priority in monsoon climate)"
-                    elif protect_moisture and k in moisture_keys and f in LOW_VARIATION_WARN:
-                        redundant = True
-                        role[f]  = f"Redundant — suppressed (moisture feature {k} preferred)"
-                    else:
-                        redundant = True
-                        role[f]   = f"Redundant — highly similar to {k}"
-                    break
-        if not redundant:
-            kept.append(f)
-
-    # Forward LOO R² selection
-    def loo_r2(feat_list):
-        if len(feat_list) == 0: return -999
-        Xs = X[:, [feature_names.index(f) for f in feat_list]]
-        sc = StandardScaler()
-        Xs = sc.fit_transform(Xs)
-        preds = []
-        for i in range(n):
-            tr_X = np.delete(Xs, i, axis=0)
-            tr_y = np.delete(y, i)
-            te_X = Xs[i:i+1]
-            mdl  = Ridge(alpha=0.01)
-            if len(set(tr_y)) > 1:
-                mdl.fit(tr_X, tr_y)
-                preds.append(float(mdl.predict(te_X)[0]))
-            else:
-                preds.append(float(np.mean(tr_y)))
-        ss_res = np.sum((np.array(preds) - y) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        return 1 - ss_res / ss_tot if ss_tot > 0 else -999
-
-    final = []
-    base_r2 = -999
-    for f in kept:
-        new_r2 = loo_r2(final + [f])
-        if new_r2 >= base_r2 + loo_improvement:
-            final.append(f)
-            base_r2 = new_r2
-            role[f] = "✅ In model"
-
-    for f in kept:
-        if role[f] not in ("✅ In model",) and "Redundant" not in role[f] and "Replaced" not in role[f] and "suppressed" not in role[f]:
-            role[f] = "Did not improve LOO R² — not added"
-
-    return final, composites, directions, role, warns, base_r2
-
-# ─── Ridge regression with LOO CV ────────────────────────────────────────────
-def fit_ridge_loo(X_sel, y, alpha=0.01):
-    n = len(y)
-    sc = StandardScaler()
-    Xs = sc.fit_transform(X_sel)
-    mdl = Ridge(alpha=alpha)
-    mdl.fit(Xs, y)
-    # LOO predictions
-    preds = []
-    for i in range(n):
-        tr_X = np.delete(Xs, i, 0); tr_y = np.delete(y, i)
-        te_X = Xs[i:i+1]
-        m2 = Ridge(alpha=alpha)
-        if len(set(tr_y)) > 1:
-            m2.fit(tr_X, tr_y)
-            preds.append(float(m2.predict(te_X)[0]))
-        else:
-            preds.append(float(np.mean(tr_y)))
-    preds = np.array(preds)
-    ss_res = np.sum((preds - y) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    r2_loo = 1 - ss_res / ss_tot if ss_tot > 0 else -999
-    mae    = np.mean(np.abs(preds - y))
-    # Recover coefficients in original scale
-    coef_scaled = mdl.coef_
-    coef_orig   = coef_scaled / (sc.scale_ + 1e-12)
-    intercept   = float(mdl.intercept_) - float(np.dot(coef_orig, sc.mean_))
-    return mdl, sc, r2_loo, mae, preds, coef_orig, intercept
-
-# ─── Equation string ─────────────────────────────────────────────────────────
-def eq_string(target, intercept, coefs, feat_names, r2, mae):
-    parts = [f"{intercept:+.3f}"]
-    for c, f in zip(coefs, feat_names):
-        parts.append(f"{c:+.5f} × {f}")
-    eq   = f"{target} = " + " ".join(parts)
-    info = f"[Ridge α=0.01, {len(feat_names)} feature(s), R²(LOO)={r2:.3f}, MAE=±{mae:.1f} d]"
-    return eq, info
-
-# ─── DOY → calendar date ─────────────────────────────────────────────────────
-def doy_to_date(year, doy):
-    try:
-        if doy and 1 <= doy <= 366:
-            return (datetime.date(int(year), 1, 1) + datetime.timedelta(days=int(doy) - 1)).strftime("%b %d")
-    except: pass
-    return "—"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN APP
-# ═══════════════════════════════════════════════════════════════════════════════
-st.title("🌲 Universal Indian Forest Phenology Predictor — v6")
-st.caption("**Monsoon-aware · Causal feature selection · Transparent driver diagnosis**")
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    st.subheader("📂 Upload Data")
-    ndvi_file = st.file_uploader("NDVI CSV  (Date, NDVI)", type="csv", key="ndvi")
-    met_file  = st.file_uploader("Meteorology CSV  (NASA POWER format)", type="csv", key="met")
-
-    st.subheader("🔧 Model Settings")
-    threshold_pct = st.slider("SOS/EOS threshold (% amplitude)", 10, 40, 20, 5,
-                              help="20% is standard; higher = stricter green-up definition") / 100
-    window_sos = st.selectbox("Pre-SOS met window (days)", [30, 60, 90], index=1,
-                              help="v6 default: 60d — captures monsoon onset signal better than 30d")
-    window_pos = st.selectbox("Pre-POS met window (days)", [30, 60], index=0)
-    window_eos = st.selectbox("Pre-EOS met window (days)", [30, 60], index=0)
-    pearson_thr = st.slider("Min Pearson |r| for features", 0.30, 0.70, 0.40, 0.05)
-    protect_moisture = st.checkbox("🌧️ Protect moisture features from T2M suppression",
-                                   value=True,
-                                   help="v6: prevents PRECTOTCORR/RH2M being dropped in favour of T2M in monsoon climates")
-    st.markdown("---")
-    st.caption("v6 — Built with ❤️ for Indian forest research")
-
-# ── Load data ─────────────────────────────────────────────────────────────────
-@st.cache_data
-def load_data(ndvi_bytes, met_bytes):
-    ndvi_df = pd.read_csv(io.BytesIO(ndvi_bytes))
-    # Detect date column
-    date_col = next((c for c in ndvi_df.columns if "date" in c.lower()), ndvi_df.columns[0])
-    ndvi_col = next((c for c in ndvi_df.columns if "ndvi" in c.lower()), ndvi_df.columns[1])
-    ndvi_df  = ndvi_df.rename(columns={date_col: "Date", ndvi_col: "NDVI"})
-    ndvi_df["Date"] = pd.to_datetime(ndvi_df["Date"])
-
-    # NASA POWER: skip header lines (start with #)
-    met_lines = met_bytes.decode("utf-8").splitlines()
-    skip = sum(1 for l in met_lines if l.startswith("#"))
-    met_df = pd.read_csv(io.BytesIO(met_bytes), skiprows=skip)
-    # Auto-detect date column
-    date_col2 = next((c for c in met_df.columns if "date" in c.lower()), None)
-    if date_col2:
-        met_df = met_df.rename(columns={date_col2: "Date"})
-        met_df["Date"] = pd.to_datetime(met_df["Date"])
-    else:
-        # Try YEAR, MO, DY columns (NASA POWER format)
-        if all(c in met_df.columns for c in ["YEAR","MO","DY"]):
-            met_df["Date"] = pd.to_datetime(met_df[["YEAR","MO","DY"]].rename(
-                columns={"YEAR":"year","MO":"month","DY":"day"}))
-        else:
-            met_df["Date"] = pd.to_datetime(ndvi_df["Date"])
-
-    met_df = met_df.replace(-999, np.nan).fillna(method="ffill").fillna(method="bfill")
-    df = pd.merge(ndvi_df[["Date","NDVI"]], met_df, on="Date").sort_values("Date").reset_index(drop=True)
-    return engineer_features(df)
-
-if ndvi_file and met_file:
-    df = load_data(ndvi_file.read(), met_file.read())
-    st.success(f"✅ Data loaded: {len(df)} observations · {df['Date'].min().date()} → {df['Date'].max().date()}")
-else:
-    st.info("👈 Upload NDVI and Meteorology files in the sidebar to begin. Sample files: `combined_NDVI_2003_2007.csv` and `combined_MET_2003_2007.csv`")
-    # Demo mode with sample data
-    try:
-        ndvi_demo = pd.read_csv("/app/data/ndvi/combined_NDVI_2003_2007.csv", parse_dates=["Date"])
-        met_demo  = pd.read_csv("/app/data/combined_MET_2003_2007.csv",        parse_dates=["Date"])
-        df_raw    = pd.merge(ndvi_demo, met_demo, on="Date").sort_values("Date").reset_index(drop=True)
-        df        = engineer_features(df_raw)
-        st.caption("🔄 Running with sample data (combined_NDVI_2003_2007 + combined_MET_2003_2007)")
-    except:
-        st.stop()
-
-# ── Identify growing seasons ──────────────────────────────────────────────────
-seasons_all = sorted(df["Season"].unique())
-season_counts = df.groupby("Season").size()
-full_seasons  = [s for s in seasons_all if season_counts[s] >= 20]
-if len(full_seasons) < 2:
-    st.error("⚠️ Need at least 2 complete growing seasons (≥20 observations each).")
-    st.stop()
-
-cadence = detect_cadence(df["Date"].values)
-
-# ── Extract phenology for each season ────────────────────────────────────────
-pheno_records = {}
-for s in full_seasons:
-    sub = df[df["Season"] == s]
-    p   = extract_phenology(sub, threshold_pct=threshold_pct)
-    if p:
-        pheno_records[s] = p
-
-if len(pheno_records) < 2:
-    st.error("⚠️ Could not extract phenology for ≥2 seasons. Try lowering the SOS/EOS threshold.")
-    st.stop()
-
-yrs = sorted(pheno_records.keys())
-
-# ── Build feature matrix for each event ───────────────────────────────────────
-def build_X_y(event_key, window_days):
-    rows, targets, yr_list = [], [], []
-    for s in yrs:
-        p = pheno_records[s]
-        if p[f"{event_key}_date"] is None: continue
-        tgt = p[f"{event_key}_DOY"]
-        if tgt is None: continue
-        feats = met_window_features(df, p[f"{event_key}_date"], window_days, event_key)
-        if feats:
-            rows.append(feats); targets.append(tgt); yr_list.append(s)
-    if not rows: return None, None, None, None
-    feat_df = pd.DataFrame(rows).fillna(0)
-    # Remove leakage features from X
-    feat_df = feat_df[[c for c in feat_df.columns if c not in LEAKAGE_FEATURES]]
-    return feat_df.values, np.array(targets, dtype=float), feat_df.columns.tolist(), yr_list
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TABS
-# ═══════════════════════════════════════════════════════════════════════════════
-tab_overview, tab_train, tab_driver, tab_corr, tab_predict, tab_guide = st.tabs([
-    "📊 Data Overview", "🔬 Training & Models", "🎯 Driver Analysis", "📈 Correlations", "🔮 Predict 2026", "📖 Technical Guide"
-])
-
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 1 — DATA OVERVIEW
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_overview:
-    st.subheader("Data Characterization")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Observations", len(df))
-    c2.metric("Date range", f"{df['Date'].min().date()} → {df['Date'].max().date()}")
-    c3.metric("NDVI cadence", f"~{cadence:.0f} days")
-    c4.metric("Complete seasons", len(pheno_records))
-
-    st.markdown("### Detected Phenology Per Season")
-    rows = []
-    for s in yrs:
-        p = pheno_records[s]
-        rows.append({
-            "Season": f"{s}–{s+1}",
-            "SOS (DOY)": p["SOS_DOY"],
-            "SOS Date": doy_to_date(s, p["SOS_DOY"]),
-            "POS (DOY)": p["POS_DOY"],
-            "POS Date": doy_to_date(s, p["POS_DOY"]),
-            "EOS (DOY)": p["EOS_DOY"],
-            "EOS Date": doy_to_date(s, p["EOS_DOY"]),
-            "LOS (days)": p["LOS"],
-            "Peak NDVI": p["PeakNDVI"],
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-    # NDVI plot
-    st.markdown("### NDVI Time Series")
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(df["Date"], df["NDVI"], color="#3b82f6", lw=1.2, alpha=0.7, label="NDVI")
-    colors_ev = {"SOS": "#22c55e", "POS": "#f59e0b", "EOS": "#ef4444"}
-    for s in yrs:
-        p = pheno_records[s]
-        for ev, col in colors_ev.items():
-            d = p.get(f"{ev}_date")
-            v = p.get(f"{ev}_DOY")
-            if d is not None:
-                ax.axvline(d, color=col, lw=1.5, alpha=0.7, ls="--")
-    patches = [mpatches.Patch(color=c, label=l) for l, c in colors_ev.items()]
-    ax.legend(handles=patches, fontsize=9)
-    ax.set_ylabel("NDVI"); ax.set_xlabel("Date")
-    ax.grid(axis="y", alpha=0.3); fig.tight_layout()
-    st.pyplot(fig); plt.close()
-
-    # Met summary
-    st.markdown("### Seasonal Meteorology Summary")
-    met_cols = [c for c in ["T2M","PRECTOTCORR","RH2M","WS2M","ALLSKY_SFC_SW_DWN","VPD"] if c in df.columns]
-    met_summary = df.groupby("Season")[met_cols].agg(["mean","sum"]).round(2)
-    st.dataframe(met_summary, use_container_width=True)
-
-    # v6 — Variance analysis (key diagnostic)
-    st.markdown("### 🔍 v6 Feature Variance Diagnostic")
-    st.markdown("""
-<div class='warn-box'>
-<b>⚠️ Why T2M may not be the right driver for your site:</b><br>
-The table below shows the coefficient of variation (CV%) of each meteorological variable
-across your seasons. Features with very low CV (< 2%) have almost no variation to explain
-phenological differences — they cannot reliably drive the model even if they show high
-Pearson r (due to multicollinearity with PRECTOTCORR in monsoon climates).
-</div>
-""", unsafe_allow_html=True)
-    var_rows = []
-    for col in met_cols:
-        seas_means = [df[df["Season"]==s][col].mean() for s in yrs]
-        cv = abs(np.std(seas_means) / (np.mean(seas_means) + 1e-9)) * 100
-        flag = "⚠️ Low variation — may be noise" if cv < 2 else ("✅ Good variation" if cv > 5 else "⚠️ Moderate variation")
-        var_rows.append({"Feature": col, "Season values": str([round(v,2) for v in seas_means]),
-                         "CV%": round(cv,1), "Signal quality": flag})
-    st.dataframe(pd.DataFrame(var_rows), use_container_width=True)
-
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 2 — TRAINING
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_train:
-    st.subheader("Model Training — Monsoon-Aware Feature Selection")
-
-    event_configs = {
-        "SOS": (window_sos, "🌱 Start of Season"),
-        "POS": (window_pos, "☀️ Peak of Season"),
-        "EOS": (window_eos, "🍂 End of Season"),
-    }
-    event_colors = {"SOS": "#22c55e", "POS": "#f59e0b", "EOS": "#ef4444"}
-
-    tabs_events = st.tabs(["🌱 Start of Season (SOS)", "☀️ Peak of Season (POS)", "🍂 End of Season (EOS)"])
-    model_store = {}
-
-    for (evt, (window, label)), tab_ev in zip(event_configs.items(), tabs_events):
-        with tab_ev:
-            X, y, feat_names, yr_list = build_X_y(evt, window)
-            if X is None or len(y) < 2:
-                st.warning(f"Not enough data for {evt} model."); continue
-
-            selected, composites, directions, role, warns, base_r2 = select_features(
-                X, y, feat_names,
-                pearson_threshold=pearson_thr,
-                protect_moisture=protect_moisture,
+    # ── 2. NASA POWER Loading ──────────────────────────────────────────────
+    @staticmethod
+    def load_met(uploaded_file) -> pd.DataFrame:
+        raw = uploaded_file.read().decode("utf-8", errors="ignore")
+        uploaded_file.seek(0)
+        lines = raw.splitlines()
+        # Auto-detect header row (find line with YEAR and DOY or DATE)
+        header_idx = 0
+        for i, line in enumerate(lines):
+            if re.search(r"YEAR.*DOY|DOY.*YEAR|DATE", line, re.IGNORECASE):
+                header_idx = i
+                break
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip")
+        df.columns = [c.strip() for c in df.columns]
+        # Build date
+        if "YEAR" in df.columns and "DOY" in df.columns:
+            df["date"] = pd.to_datetime(
+                df["YEAR"].astype(str) + df["DOY"].astype(str).str.zfill(3), format="%Y%j", errors="coerce"
             )
+        elif "DATE" in df.columns:
+            df["date"] = pd.to_datetime(df["DATE"], infer_datetime_format=True, errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        # Replace -999 sentinel
+        df = df.replace(-999.0, np.nan).replace(-99.0, np.nan)
+        return df
 
-            if not selected:
-                st.warning("No features passed selection threshold. Try lowering Min Pearson |r|.")
+    # ── 3. Data-Driven Cadence & Cycle ─────────────────────────────────────
+    @staticmethod
+    def detect_cadence(ndvi_df: pd.DataFrame) -> int:
+        diffs = ndvi_df["date"].diff().dt.days.dropna()
+        cadence = int(np.median(diffs[diffs > 0]))
+        return max(cadence, 1)
+
+    @staticmethod
+    def detect_cycle_length(smooth: np.ndarray, cadence: int) -> int:
+        from numpy.fft import fft, fftfreq
+        n = len(smooth)
+        if n < 60:
+            return 365
+        yf = np.abs(fft(smooth - smooth.mean()))
+        xf = fftfreq(n, d=cadence)
+        xf_pos = xf[1 : n // 2]
+        yf_pos = yf[1 : n // 2]
+        periods = 1.0 / (xf_pos + 1e-9)
+        valid = (periods > 200) & (periods < 800)
+        if valid.sum() == 0:
+            return 365
+        dominant_period = int(periods[valid][np.argmax(yf_pos[valid])])
+        return np.clip(dominant_period, 270, 550)
+
+    # ── 4. Season Segmentation ─────────────────────────────────────────────
+    @staticmethod
+    def segment_seasons(ndvi_df: pd.DataFrame, cadence: int, amplitude_pct: float = 0.25):
+        dates = ndvi_df["date"].values
+        ndvi_raw = ndvi_df["NDVI"].values.copy()
+
+        # Interpolate to regular grid (within segments only)
+        date_nums = (pd.DatetimeIndex(dates) - pd.Timestamp("2000-01-01")).days.values
+        all_days = np.arange(date_nums[0], date_nums[-1] + 1, cadence)
+        f_interp = interp1d(date_nums, ndvi_raw, bounds_error=False, fill_value=np.nan)
+        ndvi_interp = f_interp(all_days)
+
+        # SG smoothing (window ≤ 31 steps)
+        n = len(ndvi_interp)
+        sg_win = min(31, n if n % 2 == 1 else n - 1)
+        sg_win = max(sg_win, 5)
+        smooth = savgol_filter(np.nan_to_num(ndvi_interp, nan=np.nanmean(ndvi_interp)), sg_win, 3)
+
+        # Cycle length
+        cycle_len = PhenologyEngine.detect_cycle_length(smooth, cadence)
+        min_trough_dist = max(10, int(0.40 * cycle_len / cadence))
+
+        # Trough detection
+        neg_smooth = -smooth
+        troughs, _ = find_peaks(neg_smooth, distance=min_trough_dist, height=-np.percentile(smooth, 85))
+        if len(troughs) < 2:
+            troughs, _ = find_peaks(neg_smooth, distance=min_trough_dist // 2)
+        if len(troughs) < 2:
+            return [], smooth, all_days
+
+        # MIN_AMPLITUDE from data (5% of P5–P95 range)
+        p5, p95 = np.percentile(ndvi_raw, 5), np.percentile(ndvi_raw, 95)
+        min_amp = 0.05 * (p95 - p5)
+
+        seasons = []
+        for i in range(len(troughs) - 1):
+            t0, t1 = troughs[i], troughs[i + 1]
+            seg = smooth[t0:t1 + 1]
+            if len(seg) < 5:
+                continue
+            amp = seg.max() - seg.min()
+            if amp < min_amp:
+                continue
+            year_start = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(all_days[t0]))
+            seasons.append({
+                "idx0": t0, "idx1": t1,
+                "seg": seg,
+                "day0": all_days[t0],
+                "year": year_start.year,
+            })
+        return seasons, smooth, all_days
+
+    # ── 5. SOS / POS / EOS Extraction ─────────────────────────────────────
+    @staticmethod
+    def extract_events(seasons, smooth, all_days, ndvi_raw_df, threshold_pct=0.25):
+        records = []
+        for s in seasons:
+            seg = s["seg"]
+            t0, t1 = s["idx0"], s["idx1"]
+            vmin, vmax = seg.min(), seg.max()
+            amp = vmax - vmin
+            if amp < 1e-4:
+                continue
+            thresh = vmin + threshold_pct * amp
+
+            # SOS: first crossing upward
+            sos_local = None
+            for k in range(1, len(seg)):
+                if seg[k - 1] < thresh <= seg[k]:
+                    sos_local = k
+                    break
+            # EOS: last crossing downward
+            eos_local = None
+            for k in range(len(seg) - 1, 0, -1):
+                if seg[k - 1] >= thresh > seg[k]:
+                    eos_local = k
+                    break
+
+            if sos_local is None or eos_local is None or sos_local >= eos_local:
                 continue
 
-            X_sel = X[:, [feat_names.index(f) for f in selected]]
-            mdl, sc, r2_loo, mae, preds, coefs, intercept = fit_ridge_loo(X_sel, y)
+            sos_abs = t0 + sos_local
+            eos_abs = t0 + eos_local
 
-            model_store[evt] = {
-                "model": mdl, "scaler": sc, "features": selected,
-                "coefs": coefs, "intercept": intercept,
-                "r2_loo": r2_loo, "mae": mae, "window": window,
-                "X": X, "y": y, "feat_names": feat_names,
-                "yr_list": yr_list, "preds": preds,
-            }
-
-            # ── Equation ──
-            eq, info = eq_string(f"{evt}_days_from_Jan1", intercept, coefs, selected, r2_loo, mae)
-            st.markdown(f'<div class="eq-box">{eq}<br><small style="color:#a6e3a1">{info}</small></div>', unsafe_allow_html=True)
-
-            # ── v6: driver explanation ──
-            st.markdown("#### 🔍 Why these features? (v6 Causal Diagnosis)")
-            for f in selected:
-                cv = abs(np.std(X[:, feat_names.index(f)]) / (np.mean(X[:, feat_names.index(f)]) + 1e-9)) * 100
-                qual = "✅ Good causal candidate" if cv > 5 else "⚠️ Low variation — verify causality"
-                st.markdown(f'<div class="driver-good"><b>{f}</b> — r={composites[f]:.3f}, CV={cv:.1f}% &nbsp;|&nbsp; {qual}</div>', unsafe_allow_html=True)
-            if warns:
-                for f, w in warns.items():
-                    st.markdown(f'<div class="driver-warn"><b>{f}</b>: {w}</div>', unsafe_allow_html=True)
-
-            # ── Feature role table ──
-            st.markdown("#### Feature Role Table")
-            role_rows = []
-            for f in feat_names:
-                xi  = X[:, feat_names.index(f)]
-                r_p = pearsonr(xi, y)[0] if np.std(xi) > 0 else 0
-                r_s = spearmanr(xi, y)[0] if np.std(xi) > 0 else 0
-                cv  = abs(np.std(xi) / (np.mean(xi) + 1e-9)) * 100
-                role_rows.append({
-                    "Feature": f,
-                    "Pearson r": round(r_p, 3),
-                    "Spearman ρ": round(r_s, 3),
-                    "Composite": round(composites.get(f, 0), 3),
-                    "CV%": round(cv, 1),
-                    "Role": role.get(f, "—"),
-                })
-            role_df = pd.DataFrame(role_rows).sort_values("Composite", ascending=False)
-
-            def color_role(val):
-                if "In model" in str(val):     return "background-color: #dcfce7; color: #166534"
-                if "Redundant" in str(val) or "suppressed" in str(val): return "background-color: #f3f4f6; color: #6b7280"
-                if "Leakage" in str(val) or "LEAKAGE" in str(val): return "background-color: #fff7ed; color: #c2410c"
-                if "Replaced" in str(val):     return "background-color: #eff6ff; color: #1d4ed8"
-                return ""
-            st.dataframe(role_df.style.applymap(color_role, subset=["Role"]), use_container_width=True)
-
-            # ── Obs vs Pred ──
-            st.markdown("#### Observed vs Predicted")
-            fig2, ax2 = plt.subplots(figsize=(6, 4))
-            ax2.scatter(y, preds, color=event_colors[evt], s=80, zorder=3)
-            for i, yr in enumerate(yr_list):
-                ax2.annotate(str(yr), (y[i], preds[i]), textcoords="offset points", xytext=(5,5), fontsize=9)
-            lo = min(y.min(), preds.min()) - 5; hi = max(y.max(), preds.max()) + 5
-            ax2.plot([lo, hi], [lo, hi], "k--", lw=1, alpha=0.5)
-            ax2.set_xlabel(f"Observed {evt} DOY"); ax2.set_ylabel(f"Predicted {evt} DOY")
-            ax2.set_title(f"{label}  |  R²(LOO)={r2_loo:.3f}  MAE=±{mae:.1f}d")
-            ax2.grid(alpha=0.3); fig2.tight_layout()
-            st.pyplot(fig2); plt.close()
-
-            # Download
-            dl_df = pd.DataFrame({"Season": yr_list, f"Obs_{evt}_DOY": y, f"Pred_{evt}_DOY": preds.round(1)})
-            st.download_button(f"⬇ Download {evt} results CSV", dl_df.to_csv(index=False),
-                               file_name=f"phenology_{evt}_v6.csv", mime="text/csv")
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 3 — DRIVER ANALYSIS  (ported from phenology_model.jsx)
-# Sensitivity analysis: ∂metric/∂factor for each phenological event × met variable
-# Mirrors the JSX: Driver Bar Chart, Sensitivity Heatmap, Factor Radar, 
-#                  Cross-metric dominance cards, and Dominant Driver summary
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_driver:
-    st.subheader("🎯 Driver Analysis — Sensitivity & Factor Attribution")
-    st.caption("Shows how much each climate variable influences each phenological metric (∂DOY / ∂factor), ported from the interactive JSX model.")
-
-    if not model_store:
-        st.info("Train models first (Training & Models tab) to enable driver analysis.")
-    else:
-        # ── Compute numerical sensitivity: perturb each feature by +10%, measure ΔDOY ──
-        FACTOR_LABELS = {
-            "T2M":              "Temperature",
-            "PRECTOTCORR_sum":  "Precipitation",
-            "RH2M":             "Humidity",
-            "WS2M":             "Wind Speed",
-            "ALLSKY_SFC_SW_DWN":"Solar Radiation",
-            "VPD":              "Vapour Pressure Deficit",
-            "SPEI_proxy":       "SPEI Moisture Index",
-            "DTR":              "Diurnal Temp Range",
-        }
-        METRIC_LABELS_D = {"SOS": "Start of Season", "POS": "Peak of Season", "EOS": "End of Season"}
-        EVENT_COLORS    = {"SOS": "#22c55e", "POS": "#f59e0b", "EOS": "#ef4444"}
-        FACTOR_COLORS   = {
-            "T2M": "#FF6B35", "PRECTOTCORR_sum": "#4A90D9", "RH2M": "#52C41A",
-            "WS2M": "#9B59B6", "ALLSKY_SFC_SW_DWN": "#F5C518",
-            "VPD": "#E74C3C", "SPEI_proxy": "#1ABC9C", "DTR": "#E67E22",
-        }
-
-        def compute_sensitivity(info):
-            """Numerical perturbation: perturb each selected feature by +10%, compute ΔDOY."""
-            mdl       = info["model"]
-            sc        = info["scaler"]
-            feat_sel  = info["features"]
-            feat_all  = info["feat_names"]
-            X_tr      = info["X"]
-            sens      = {}
-            # Base prediction = mean of training inputs
-            base_vec  = np.array([[np.mean(X_tr[:, feat_all.index(f)]) for f in feat_sel]])
-            base_pred = float(mdl.predict(sc.transform(base_vec))[0])
-            for f in feat_sel:
-                base_val = base_vec[0, feat_sel.index(f)]
-                delta    = abs(base_val) * 0.10 + 0.01   # 10% perturbation
-                pert_vec = base_vec.copy()
-                pert_vec[0, feat_sel.index(f)] += delta
-                pert_pred = float(mdl.predict(sc.transform(pert_vec))[0])
-                # Sensitivity = ΔDOY per unit change (normalised as %DOY per %factor)
-                pct_change_factor = delta / (abs(base_val) + 1e-9) * 100
-                pct_change_doy    = (pert_pred - base_pred) / (abs(base_pred) + 1e-9) * 100
-                sens[f] = round(pct_change_doy / pct_change_factor * 100, 2)  # %DOY per 1% factor
-            return sens, base_pred
-
-        # Build sensitivity matrix: events × features
-        sens_matrix = {}
-        base_preds  = {}
-        all_features_used = set()
-        for evt, info in model_store.items():
-            s, bp = compute_sensitivity(info)
-            sens_matrix[evt] = s
-            base_preds[evt]  = bp
-            all_features_used.update(s.keys())
-
-        all_features_used = sorted(all_features_used)
-
-        # ── Select metric to explore ──
-        active_metric = st.selectbox(
-            "Select phenological metric to analyse",
-            list(model_store.keys()),
-            format_func=lambda x: f"{x} — {METRIC_LABELS_D.get(x, x)}",
-        )
-        sens_for_metric = sens_matrix.get(active_metric, {})
-
-        # ── Layout: 3 columns ──
-        col_bar, col_radar, col_dom = st.columns([2, 2, 1])
-
-        # ── 1. Driver Bar Chart (like JSX Tab 2) ──
-        with col_bar:
-            st.markdown(f"##### Sensitivity of **{METRIC_LABELS_D.get(active_metric, active_metric)}** to each factor")
-            st.caption("% change in DOY per 1% increase in factor")
-            if sens_for_metric:
-                bar_feats = sorted(sens_for_metric.items(), key=lambda x: -abs(x[1]))
-                feat_names_bar = [FACTOR_LABELS.get(f, f) for f, _ in bar_feats]
-                sens_vals      = [v for _, v in bar_feats]
-                colors_bar     = [FACTOR_COLORS.get(f, "#888") for f, _ in bar_feats]
-
-                fig_bar, ax_bar = plt.subplots(figsize=(6, max(3, len(bar_feats) * 0.6)))
-                bars = ax_bar.barh(feat_names_bar, sens_vals,
-                                   color=[c if v >= 0 else "#ef4444" for c, v in zip(colors_bar, sens_vals)],
-                                   alpha=0.85, edgecolor="white", linewidth=0.5)
-                ax_bar.axvline(0, color="black", lw=0.8)
-                ax_bar.set_xlabel("Sensitivity (%DOY / 1% factor change)", fontsize=9)
-                ax_bar.set_title(f"{active_metric} Driver Sensitivity", fontsize=10, fontweight="bold",
-                                 color=EVENT_COLORS.get(active_metric, "#333"))
-                for bar, val in zip(bars, sens_vals):
-                    ax_bar.text(val + (0.01 if val >= 0 else -0.01), bar.get_y() + bar.get_height()/2,
-                                f"{val:+.2f}", va="center", ha="left" if val >= 0 else "right", fontsize=8)
-                ax_bar.grid(axis="x", alpha=0.3); fig_bar.tight_layout()
-                st.pyplot(fig_bar); plt.close()
-
-                # Interpretation text (like JSX "Driver Interpretation")
-                st.markdown("**Top driver interpretation:**")
-                for i, (f, v) in enumerate(bar_feats[:3]):
-                    label = FACTOR_LABELS.get(f, f)
-                    metric_label = METRIC_LABELS_D.get(active_metric, active_metric).lower()
-                    direction = f"delays/extends **{metric_label}**" if v > 0 else f"advances **{metric_label}**"
-                    st.markdown(
-                        f"**{i+1}. {label}** — ↑ increasing {label.lower()} {direction} "
-                        f"by `{abs(v):.2f}%` per 1% unit increase",
-                        help=f"Numerical perturbation: +10% change in {f}"
-                    )
-            else:
-                st.info("No sensitivity data — feature may not be in selected model.")
-
-        # ── 2. Factor Radar (like JSX Tab 4) ──
-        with col_radar:
-            st.markdown(f"##### Factor influence magnitude on **{active_metric}**")
-            if sens_for_metric:
-                radar_labels = [FACTOR_LABELS.get(f, f) for f in sens_for_metric]
-                radar_vals   = [abs(v) for v in sens_for_metric.values()]
-                # Close the radar polygon
-                radar_vals_c   = radar_vals + [radar_vals[0]]
-                angles         = np.linspace(0, 2 * np.pi, len(radar_labels), endpoint=False).tolist()
-                angles_c       = angles + [angles[0]]
-
-                fig_rad, ax_rad = plt.subplots(figsize=(4.5, 4.5), subplot_kw=dict(polar=True))
-                ax_rad.fill(angles_c, radar_vals_c,
-                            alpha=0.25, color=EVENT_COLORS.get(active_metric, "#4A90D9"))
-                ax_rad.plot(angles_c, radar_vals_c, lw=2,
-                            color=EVENT_COLORS.get(active_metric, "#4A90D9"))
-                ax_rad.set_xticks(angles)
-                ax_rad.set_xticklabels(radar_labels, fontsize=8)
-                ax_rad.set_title(f"{active_metric} — Factor Radar", fontsize=10,
-                                 fontweight="bold", pad=18)
-                ax_rad.grid(True, alpha=0.3); fig_rad.tight_layout()
-                st.pyplot(fig_rad); plt.close()
-
-        # ── 3. Dominant driver card (like JSX left panel) ──
-        with col_dom:
-            st.markdown("##### Dominant Driver")
-            if sens_for_metric:
-                dom_feat, dom_val = max(sens_for_metric.items(), key=lambda x: abs(x[1]))
-                dom_label  = FACTOR_LABELS.get(dom_feat, dom_feat)
-                dom_color  = FACTOR_COLORS.get(dom_feat, "#888")
-                direction_word = "delays ↑" if dom_val > 0 else "advances ↓"
-                st.markdown(f"""
-<div style="background:#f0f9ff;border:2px solid {dom_color};border-radius:12px;padding:16px;text-align:center;">
-  <div style="font-size:11px;color:#666;margin-bottom:6px">for {METRIC_LABELS_D.get(active_metric, active_metric)}</div>
-  <div style="font-size:20px;font-weight:700;color:{dom_color}">{dom_label}</div>
-  <div style="font-size:13px;margin-top:8px;color:#444">{direction_word}</div>
-  <div style="font-size:22px;font-weight:800;color:{dom_color};margin-top:4px">{abs(dom_val):.2f}%</div>
-  <div style="font-size:10px;color:#888">per 1% unit increase</div>
-</div>
-""", unsafe_allow_html=True)
-
-                # All events dominant driver
-                st.markdown("---")
-                st.markdown("**Dominant driver per event:**")
-                for evt, s_dict in sens_matrix.items():
-                    if s_dict:
-                        top_f, top_v = max(s_dict.items(), key=lambda x: abs(x[1]))
-                        top_lbl   = FACTOR_LABELS.get(top_f, top_f)
-                        top_color = FACTOR_COLORS.get(top_f, "#888")
-                        st.markdown(
-                            f'<div style="background:#f8f8f8;border-left:4px solid {EVENT_COLORS.get(evt,"#888")};'
-                            f'border-radius:6px;padding:8px 10px;margin-bottom:6px">'
-                            f'<b style="color:{EVENT_COLORS.get(evt,"#333")}">{evt}</b><br>'
-                            f'<span style="color:{top_color};font-weight:600">{top_lbl}</span>'
-                            f'<span style="color:#888;font-size:11px"> ({top_v:+.2f}%)</span></div>',
-                            unsafe_allow_html=True
-                        )
-
-        # ── 4. Full Sensitivity Heatmap (like JSX Tab 3) ──
-        st.markdown("---")
-        st.markdown("### 🔥 Full Sensitivity Heatmap — All Events × All Features")
-        st.caption("Each cell = % change in event DOY per 1% increase in that climate variable. Red = delays event, Blue = advances event.")
-
-        # Collect all features across all events for unified table
-        all_feats_heat = []
-        for evt in model_store:
-            for f in sens_matrix.get(evt, {}):
-                if f not in all_feats_heat:
-                    all_feats_heat.append(f)
-
-        if all_feats_heat:
-            heat_data = []
-            for f in all_feats_heat:
-                row = {"Climate Variable": FACTOR_LABELS.get(f, f)}
-                for evt in ["SOS", "POS", "EOS"]:
-                    row[evt] = sens_matrix.get(evt, {}).get(f, None)
-                heat_data.append(row)
-            heat_df = pd.DataFrame(heat_data).set_index("Climate Variable")
-
-            # Color the heatmap
-            def heat_style(val):
-                if val is None or np.isnan(float(val) if val is not None else np.nan):
-                    return "background-color: #f5f5f5; color: #ccc"
-                v = float(val)
-                max_abs = max(
-                    max((abs(v2) for row in heat_data for k, v2 in row.items() if k != "Climate Variable" and v2 is not None), default=1),
-                    0.01
-                )
-                norm = v / max_abs
-                if norm > 0:
-                    intensity = int(norm * 180)
-                    return f"background-color: rgb(255,{255-intensity},{255-intensity}); color: {'#500' if intensity>100 else '#333'}"
-                else:
-                    intensity = int(abs(norm) * 180)
-                    return f"background-color: rgb({255-intensity},{255-intensity},255); color: {'#005' if intensity>100 else '#333'}"
-
-            styled = heat_df.style.applymap(heat_style).format(
-                lambda v: f"{v:+.2f}%" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "—"
+            # POS: raw NDVI max in window
+            sos_day = all_days[sos_abs]
+            eos_day = all_days[eos_abs]
+            window_mask = (
+                (pd.DatetimeIndex(ndvi_raw_df["date"]) >= pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(sos_day))) &
+                (pd.DatetimeIndex(ndvi_raw_df["date"]) <= pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(eos_day)))
             )
-            st.dataframe(styled, use_container_width=True)
+            if window_mask.sum() == 0:
+                continue
+            raw_win = ndvi_raw_df[window_mask]
+            pos_row = raw_win.loc[raw_win["NDVI"].idxmax()]
 
-            # Legend
-            st.markdown("""
-<div style="display:flex;gap:24px;font-size:12px;margin-top:6px">
-  <span><span style="background:rgb(255,75,75);padding:2px 10px;border-radius:3px">&nbsp;</span> &nbsp;Delays event (positive)</span>
-  <span><span style="background:rgb(75,75,255);padding:2px 10px;border-radius:3px">&nbsp;</span> &nbsp;Advances event (negative)</span>
-  <span><span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 10px;border-radius:3px">—</span> &nbsp;Feature not in this event's model</span>
-</div>
-""", unsafe_allow_html=True)
+            sos_date = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(sos_day))
+            eos_date = pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(eos_day))
+            pos_date = pd.Timestamp(pos_row["date"])
 
-        # ── 5. Cross-metric driver dominance cards (like JSX radar bottom grid) ──
-        st.markdown("---")
-        st.markdown("### 🃏 Cross-Metric Driver Dominance")
-        st.caption("Which climate variable has the strongest influence on each phenological event?")
-        card_cols = st.columns(len(model_store))
-        for col_c, (evt, s_dict) in zip(card_cols, sens_matrix.items()):
-            with col_c:
-                if s_dict:
-                    sorted_drivers = sorted(s_dict.items(), key=lambda x: -abs(x[1]))
-                    dom_f, dom_v   = sorted_drivers[0]
-                    dom_lbl = FACTOR_LABELS.get(dom_f, dom_f)
-                    dom_col = FACTOR_COLORS.get(dom_f, "#888")
-                    evt_col = EVENT_COLORS.get(evt, "#333")
-                    st.markdown(f"""
-<div style="border:2px solid {evt_col};border-radius:10px;padding:14px;text-align:center;margin-bottom:8px">
-  <div style="font-size:18px;font-weight:800;color:{evt_col}">{evt}</div>
-  <div style="font-size:11px;color:#888;margin-bottom:8px">{METRIC_LABELS_D.get(evt,'')}</div>
-  <div style="font-size:15px;font-weight:700;color:{dom_col}">{dom_lbl}</div>
-  <div style="font-size:12px;color:#666;margin-top:4px">{abs(dom_v):.2f}% sensitivity</div>
-</div>
-""", unsafe_allow_html=True)
-                    # Show all ranked drivers for this event
-                    for rank, (f, v) in enumerate(sorted_drivers):
-                        lbl = FACTOR_LABELS.get(f, f)
-                        fc  = FACTOR_COLORS.get(f, "#888")
-                        bar_w = int(abs(v) / (abs(sorted_drivers[0][1]) + 1e-9) * 100)
-                        st.markdown(
-                            f'<div style="font-size:11px;margin-bottom:3px">'
-                            f'<span style="color:{fc};font-weight:600">{rank+1}. {lbl}</span>'
-                            f'<span style="color:#999"> {v:+.2f}%</span>'
-                            f'<div style="background:{fc};height:4px;width:{bar_w}%;border-radius:2px;opacity:0.6;margin-top:2px"></div>'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-
-        # ── Download sensitivity table ──
-        st.markdown("---")
-        if all_feats_heat:
-            heat_dl = pd.DataFrame([
-                {"Feature": FACTOR_LABELS.get(f, f),
-                 **{evt: sens_matrix.get(evt, {}).get(f, None) for evt in ["SOS","POS","EOS"]}}
-                for f in all_feats_heat
-            ])
-            st.download_button(
-                "⬇ Download sensitivity matrix CSV",
-                heat_dl.to_csv(index=False),
-                file_name="driver_sensitivity_v6.csv",
-                mime="text/csv"
-            )
-
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 3 — CORRELATIONS
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_corr:
-    st.subheader("Feature Correlations with Phenology Metrics")
-
-    met_vars_plot = [c for c in ["T2M","PRECTOTCORR","RH2M","WS2M","ALLSKY_SFC_SW_DWN","VPD","DTR","SPEI_proxy"] if c in df.columns]
-    metrics_plot  = {evt: np.array([pheno_records[s].get(f"{evt}_DOY") for s in yrs], dtype=float)
-                     for evt in ["SOS","POS","EOS"]}
-
-    # Seasonal mean features
-    seas_feats = {col: np.array([df[df["Season"]==s][col].mean() for s in yrs]) for col in met_vars_plot}
-
-    fig3, axes = plt.subplots(1, 3, figsize=(15, 5))
-    for ax, (evt, col) in zip(axes, [("SOS","#22c55e"),("POS","#f59e0b"),("EOS","#ef4444")]):
-        y_ev = metrics_plot[evt]
-        rs = {}
-        for feat, x_ev in seas_feats.items():
-            if np.std(x_ev) > 0:
-                rs[feat] = round(pearsonr(x_ev, y_ev)[0], 3)
-        rs_sorted = dict(sorted(rs.items(), key=lambda x: x[1]))
-        bars = ax.barh(list(rs_sorted.keys()), list(rs_sorted.values()),
-                       color=[("#22c55e" if v>=0 else "#ef4444") for v in rs_sorted.values()], alpha=0.8)
-        ax.axvline(0, color="black", lw=0.8)
-        ax.axvline(0.40, color="#f59e0b", lw=1, ls="--", alpha=0.6, label="|r|=0.40 threshold")
-        ax.axvline(-0.40, color="#f59e0b", lw=1, ls="--", alpha=0.6)
-        ax.set_title(f"{evt} vs Met features (seasonal mean)", fontweight="bold", color=col)
-        ax.set_xlabel("Pearson r"); ax.legend(fontsize=8)
-        ax.grid(axis="x", alpha=0.3)
-    fig3.tight_layout()
-    st.pyplot(fig3); plt.close()
-
-    st.markdown("### Year-by-Year Meteorology")
-    for col in ["PRECTOTCORR","T2M","RH2M"]:
-        if col not in df.columns: continue
-        fig4, ax4 = plt.subplots(figsize=(13, 3))
-        ax4.plot(df["Date"], df[col], color="#3b82f6", lw=1, alpha=0.8)
-        ax4.set_ylabel(col); ax4.set_title(col); ax4.grid(alpha=0.3)
-        fig4.tight_layout(); st.pyplot(fig4); plt.close()
-
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 4 — PREDICT 2026
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_predict:
-    st.subheader("🔮 Predict Phenology for a Future Year")
-
-    if not model_store:
-        st.warning("Train models first (Training tab)."); st.stop()
-
-    st.markdown("""
-<div class='warn-box'>
-<b>Note:</b> Enter forecast meteorological conditions for the prediction window before each event.
-Default values are training data means. Confidence reflects LOO cross-validation error.
-</div>
-""", unsafe_allow_html=True)
-
-    pred_year = st.number_input("Prediction year", 2024, 2050, 2026, step=1)
-
-    pred_results = {}
-    for evt, info in model_store.items():
-        st.markdown(f"---\n#### {evt} — {event_configs[evt][1]}")
-        st.caption(f"Using {info['window']}-day window before event  |  Features: {', '.join(info['features'])}")
-
-        # Default = training mean for each feature
-        X_tr = info["X"]
-        feat_names = info["feat_names"]
-        train_means = {f: round(float(np.mean(X_tr[:, feat_names.index(f)])), 3) for f in info["features"]}
-
-        cols = st.columns(min(4, len(info["features"])))
-        user_vals = {}
-        for i, f in enumerate(info["features"]):
-            all_vals = X_tr[:, feat_names.index(f)]
-            hint     = f"Range: [{all_vals.min():.1f} – {all_vals.max():.1f}]"
-            with cols[i % len(cols)]:
-                user_vals[f] = st.number_input(f, value=train_means[f], help=hint, key=f"{evt}_{f}")
-
-        x_pred = np.array([[user_vals[f] for f in info["features"]]])
-        x_sc   = info["scaler"].transform(x_pred)
-        doy_pred = float(info["model"].predict(x_sc)[0])
-
-        # Ecological ordering enforcement
-        if evt == "POS" and "SOS" in pred_results:
-            doy_pred = max(doy_pred, pred_results["SOS"] + 10)
-        if evt == "EOS" and "POS" in pred_results:
-            doy_pred = max(doy_pred, pred_results["POS"] + 10)
-
-        pred_results[evt] = doy_pred
-        date_str = doy_to_date(pred_year, int(round(doy_pred)))
-        st.success(f"**Predicted {evt}:** DOY {doy_pred:.1f}  →  **{date_str}, {pred_year}**  |  MAE=±{info['mae']:.1f} days")
-
-    # LOS
-    if "SOS" in pred_results and "EOS" in pred_results:
-        eos_cont = pred_results["EOS"] + (365 if pred_results["EOS"] < pred_results["SOS"] else 0)
-        los_pred = eos_cont - pred_results["SOS"]
-        st.info(f"**Predicted LOS:** ~{los_pred:.0f} days")
-
-    # Summary table
-    if pred_results:
-        st.markdown("### Prediction Summary")
-        sum_rows = []
-        for evt, doy in pred_results.items():
-            sum_rows.append({
-                "Event": evt,
-                "Predicted DOY": round(doy, 1),
-                "Calendar Date": doy_to_date(pred_year, int(round(doy))),
-                "MAE (±days)": round(model_store[evt]["mae"], 1),
-                "R²(LOO)": round(model_store[evt]["r2_loo"], 3),
+            records.append({
+                "year": s["year"],
+                "SOS": sos_date,
+                "POS": pos_date,
+                "EOS": eos_date,
+                "SOS_DOY": sos_date.dayofyear,
+                "POS_DOY": pos_date.dayofyear,
+                "EOS_DOY": eos_date.dayofyear,
+                "LOS": (eos_date - sos_date).days,
+                "Peak_NDVI": float(pos_row["NDVI"]),
+                "Amplitude": float(amp),
             })
-        sum_df = pd.DataFrame(sum_rows)
-        st.dataframe(sum_df, use_container_width=True)
-        st.download_button("⬇ Download predictions CSV", sum_df.to_csv(index=False),
-                           file_name=f"phenology_prediction_{pred_year}_v6.csv", mime="text/csv")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# TAB 5 — TECHNICAL GUIDE
-# ───────────────────────────────────────────────────────────────────────────────
-with tab_guide:
-    st.subheader("Technical Guide — v6 Improvements")
+        df = pd.DataFrame(records).drop_duplicates(subset=["year"]).sort_values("year").reset_index(drop=True)
+        return df
+
+    # ── 6. Meteorological Feature Engineering ─────────────────────────────
+    @staticmethod
+    def engineer_met_features(met_df: pd.DataFrame) -> pd.DataFrame:
+        df = met_df.copy()
+        # GDD
+        if "T2M" in df.columns:
+            df["GDD_5"] = (df["T2M"] - 5).clip(0)
+            df["GDD_10"] = (df["T2M"] - 10).clip(0)
+            df["GDD_cum"] = df["GDD_5"].cumsum()
+        if "T2M_MAX" in df.columns and "T2M_MIN" in df.columns:
+            df["DTR"] = df["T2M_MAX"] - df["T2M_MIN"]
+        # VPD
+        if "T2M" in df.columns and "RH2M" in df.columns:
+            es = 0.6108 * np.exp(17.27 * df["T2M"] / (df["T2M"] + 237.3))
+            df["VPD"] = es * (1 - df["RH2M"] / 100)
+        # Log precip
+        if "PRECTOTCORR" in df.columns:
+            df["log_precip"] = np.log1p(df["PRECTOTCORR"])
+        # MSI = radiation / (precip + 1)
+        if "ALLSKY_SFC_SW_DWN" in df.columns and "PRECTOTCORR" in df.columns:
+            df["MSI"] = df["ALLSKY_SFC_SW_DWN"] / (df["PRECTOTCORR"] + 1)
+        # SPEI proxy
+        if "T2M" in df.columns and "PRECTOTCORR" in df.columns:
+            pet = 0.0023 * (df["T2M"] + 17.8) * df.get("ALLSKY_SFC_SW_DWN", 20) ** 0.5
+            df["SPEI_proxy"] = df["PRECTOTCORR"] - pet
+        return df
+
+    # ── 7. Window-Mean Feature Computation ────────────────────────────────
+    @staticmethod
+    def compute_window_features(met_eng: pd.DataFrame, event_date: pd.Timestamp, window_days: int) -> dict:
+        t1 = event_date
+        t0 = t1 - pd.Timedelta(days=window_days)
+        mask = (met_eng["date"] >= t0) & (met_eng["date"] < t1)
+        sub = met_eng[mask]
+        if len(sub) == 0:
+            return {}
+        excl = {"date", "YEAR", "DOY", "LAT", "LON", "ELEVATION"}
+        feats = {}
+        for col in sub.columns:
+            if col in excl:
+                continue
+            vals = pd.to_numeric(sub[col], errors="coerce").dropna()
+            if len(vals) > 0:
+                feats[col] = float(vals.mean())
+        return feats
+
+    # ── 8. Feature Selection ───────────────────────────────────────────────
+    @staticmethod
+    def select_features(X: pd.DataFrame, y: pd.Series, r_thresh: float = 0.40, collin_thresh: float = 0.85):
+        if len(X) < 4 or len(y) < 4:
+            return list(X.columns[:3])
+        candidates = []
+        for col in X.columns:
+            vals = X[col].dropna()
+            if len(vals) < 4 or vals.std() < 1e-6:
+                continue
+            idx = X[col].dropna().index.intersection(y.dropna().index)
+            if len(idx) < 4:
+                continue
+            r, _ = pearsonr(X.loc[idx, col], y.loc[idx])
+            rho, _ = spearmanr(X.loc[idx, col], y.loc[idx])
+            composite = (abs(r) + abs(rho)) / 2
+            candidates.append((col, composite, r))
+        candidates.sort(key=lambda x: -x[1])
+        # Filter by threshold
+        selected = [(c, r) for c, comp, r in candidates if comp >= r_thresh]
+        if not selected:
+            selected = [(candidates[0][0], candidates[0][2])] if candidates else []
+        # Remove collinearity
+        kept = []
+        for feat, r_val in selected:
+            if not kept:
+                kept.append(feat)
+                continue
+            corr_with_kept = max(abs(X[feat].corr(X[k])) for k in kept)
+            if corr_with_kept < collin_thresh:
+                kept.append(feat)
+        return kept
+
+    # ── 9. LOO Cross-Validation ───────────────────────────────────────────
+    @staticmethod
+    def loo_cv(X: np.ndarray, y: np.ndarray, model_fn):
+        n = len(y)
+        if n < 3:
+            return np.nan, np.nan
+        preds = []
+        for i in range(n):
+            idx_train = [j for j in range(n) if j != i]
+            Xt, yt = X[idx_train], y[idx_train]
+            Xv = X[[i]]
+            try:
+                m = model_fn()
+                m.fit(Xt, yt)
+                preds.append(float(m.predict(Xv)[0]))
+            except Exception:
+                preds.append(float(np.mean(yt)))
+        preds = np.array(preds)
+        ss_res = np.sum((y - preds) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 1e-9 else np.nan
+        mae = float(np.mean(np.abs(y - preds)))
+        return r2, mae
+
+    # ── 10. Model Fitting ─────────────────────────────────────────────────
+    @staticmethod
+    def fit_models(X: np.ndarray, y: np.ndarray):
+        results = {}
+        sc = StandardScaler()
+        Xs = sc.fit_transform(X)
+
+        # Ridge
+        ridge = RidgeCV(alphas=np.logspace(-3, 4, 30), cv=None)
+        ridge.fit(Xs, y)
+        r2, mae = PhenologyEngine.loo_cv(Xs, y, lambda: RidgeCV(alphas=np.logspace(-3, 4, 30)))
+        results["Ridge"] = {"model": ridge, "scaler": sc, "loo_r2": r2, "loo_mae": mae,
+                            "coefs": ridge.coef_, "intercept": ridge.intercept_}
+
+        # Polynomial deg-2
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import PolynomialFeatures
+        for deg in [2, 3]:
+            try:
+                poly_pipe = Pipeline([
+                    ("poly", PolynomialFeatures(degree=deg, include_bias=False)),
+                    ("sc", StandardScaler()),
+                    ("ridge", RidgeCV(alphas=np.logspace(-3, 4, 20))),
+                ])
+                poly_pipe.fit(X, y)
+                r2p, maep = PhenologyEngine.loo_cv(
+                    X, y,
+                    lambda d=deg: Pipeline([
+                        ("poly", PolynomialFeatures(degree=d, include_bias=False)),
+                        ("sc", StandardScaler()),
+                        ("ridge", RidgeCV(alphas=np.logspace(-3, 4, 20))),
+                    ])
+                )
+                results[f"Poly_deg{deg}"] = {"model": poly_pipe, "scaler": None,
+                                              "loo_r2": r2p, "loo_mae": maep,
+                                              "coefs": None, "intercept": None}
+            except Exception:
+                pass
+
+        # GPR
+        if len(y) >= 5:
+            try:
+                kernel = ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1)
+                gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
+                gpr.fit(Xs, y)
+                r2g, maeg = PhenologyEngine.loo_cv(
+                    Xs, y,
+                    lambda: GaussianProcessRegressor(
+                        kernel=ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1),
+                        normalize_y=True
+                    )
+                )
+                results["GPR"] = {"model": gpr, "scaler": sc, "loo_r2": r2g, "loo_mae": maeg,
+                                   "coefs": None, "intercept": None}
+            except Exception:
+                pass
+
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTTING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+PALETTE = {
+    "sos": "#3b82f6", "pos": "#22c55e", "eos": "#f97316",
+    "ndvi": "#22c55e", "smooth": "#a7f3d0", "met": "#f59e0b",
+}
+
+def fig_to_bytes(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    return buf
+
+def plot_ndvi_overview(ndvi_df, seasons, smooth, all_days, pheno_df):
+    fig, ax = plt.subplots(figsize=(14, 4.5), facecolor="#0e1117")
+    ax.set_facecolor("#0e1117")
+    ax.patch.set_alpha(0.0)
+
+    # Raw
+    ax.scatter(ndvi_df["date"], ndvi_df["NDVI"], s=12, color="#4ade80", alpha=0.5, label="Raw NDVI", zorder=2)
+
+    # Smooth
+    smooth_dates = [pd.Timestamp("2000-01-01") + pd.Timedelta(days=int(d)) for d in all_days]
+    ax.plot(smooth_dates, smooth, color="#a7f3d0", lw=1.5, label="SG Smooth", zorder=3)
+
+    # Phenology markers
+    if not pheno_df.empty:
+        for _, row in pheno_df.iterrows():
+            ax.axvline(row["SOS"], color=PALETTE["sos"], alpha=0.5, lw=1.2, ls="--")
+            ax.axvline(row["POS"], color=PALETTE["pos"], alpha=0.5, lw=1.2, ls="-.")
+            ax.axvline(row["EOS"], color=PALETTE["eos"], alpha=0.5, lw=1.2, ls=":")
+
+    ax.set_xlabel("Date", color="#9ca3af", fontsize=10)
+    ax.set_ylabel("NDVI", color="#9ca3af", fontsize=10)
+    ax.tick_params(colors="#9ca3af")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#374151")
+    legend_elements = [
+        Patch(facecolor=PALETTE["sos"], label="SOS"),
+        Patch(facecolor=PALETTE["pos"], label="POS"),
+        Patch(facecolor=PALETTE["eos"], label="EOS"),
+    ]
+    ax.legend(handles=legend_elements + [
+        plt.Line2D([0], [0], color="#4ade80", marker="o", ls="", ms=5, label="Raw"),
+        plt.Line2D([0], [0], color="#a7f3d0", lw=2, label="Smooth"),
+    ], facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8, loc="upper left")
+    ax.set_title("NDVI Time Series with Phenology Events", color="#e5e7eb", fontsize=12, pad=10)
+    plt.tight_layout()
+    return fig
+
+
+def plot_correlation_bar(corr_df, event):
+    fig, ax = plt.subplots(figsize=(9, max(3, len(corr_df) * 0.45)), facecolor="#0e1117")
+    ax.set_facecolor("#1e2530")
+    colors = ["#22c55e" if r >= 0 else "#ef4444" for r in corr_df["pearson_r"]]
+    bars = ax.barh(corr_df["feature"], corr_df["pearson_r"].abs(), color=colors, edgecolor="#374151", height=0.6)
+    for bar, r in zip(bars, corr_df["pearson_r"]):
+        ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                f"{r:+.3f}", va="center", color="#e5e7eb", fontsize=8)
+    ax.axvline(0.40, color="#fbbf24", ls="--", lw=1.2, label="|r|=0.40 threshold")
+    ax.set_xlabel("|Pearson r|", color="#9ca3af")
+    ax.set_title(f"Feature Correlations — {event}", color="#e5e7eb", fontsize=11)
+    ax.tick_params(colors="#9ca3af")
+    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+    ax.legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def plot_obs_pred(y_obs, y_pred, event, r2, mae):
+    fig, ax = plt.subplots(figsize=(5, 5), facecolor="#0e1117")
+    ax.set_facecolor("#1e2530")
+    ax.scatter(y_obs, y_pred, color="#22c55e", s=60, edgecolor="#a7f3d0", zorder=3)
+    lims = [min(y_obs.min(), min(y_pred)), max(y_obs.max(), max(y_pred))]
+    ax.plot(lims, lims, "w--", lw=1.2, alpha=0.5)
+    ax.set_xlabel("Observed DOY", color="#9ca3af")
+    ax.set_ylabel("Predicted DOY", color="#9ca3af")
+    ax.tick_params(colors="#9ca3af")
+    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+    r2_str = f"{r2:.3f}" if not np.isnan(r2) else "N/A"
+    ax.set_title(f"{event}  R²={r2_str}  MAE={mae:.1f}d", color="#e5e7eb", fontsize=10)
+    plt.tight_layout()
+    return fig
+
+
+def plot_corr_heatmap(feat_matrix: pd.DataFrame):
+    corr = feat_matrix.corr()
+    fig, ax = plt.subplots(figsize=(max(6, len(corr) * 0.8), max(5, len(corr) * 0.7)), facecolor="#0e1117")
+    ax.set_facecolor("#1e2530")
+    im = ax.imshow(corr.values, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(corr.columns)))
+    ax.set_yticks(range(len(corr.index)))
+    ax.set_xticklabels(corr.columns, rotation=45, ha="right", color="#9ca3af", fontsize=8)
+    ax.set_yticklabels(corr.index, color="#9ca3af", fontsize=8)
+    for i in range(len(corr)):
+        for j in range(len(corr.columns)):
+            ax.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center",
+                    color="black" if abs(corr.iloc[i, j]) > 0.5 else "#e5e7eb", fontsize=7)
+    plt.colorbar(im, ax=ax, fraction=0.03)
+    ax.set_title("Feature Correlation Heatmap", color="#e5e7eb", fontsize=11)
+    plt.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_state():
+    defaults = {
+        "ndvi_df": None, "met_df": None, "met_eng": None,
+        "seasons": None, "smooth": None, "all_days": None,
+        "pheno_df": None, "feature_df": None, "models": {},
+        "corr_tables": {}, "trained": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("## 🌲 Forest Phenology v5")
+        st.markdown("---")
+        st.markdown("### 📂 Upload Data")
+        ndvi_file = st.file_uploader("NDVI CSV", type=["csv"], key="ndvi_upload",
+                                     help="Columns: date, NDVI")
+        met_file = st.file_uploader("NASA POWER Meteorology CSV", type=["csv"], key="met_upload",
+                                    help="NASA POWER daily export — headers auto-detected")
+        st.markdown("---")
+        st.markdown("### ⚙️ Parameters")
+        threshold_pct = st.slider("SOS/EOS threshold (% amplitude)", 10, 50, 25, 5,
+                                   help="50% amplitude threshold = standard half-max method") / 100
+        window_days = st.slider("Meteorological window (days before event)", 15, 90, 30, 5)
+        r_thresh = st.slider("Feature selection |r| threshold", 0.20, 0.70, 0.40, 0.05)
+        st.markdown("---")
+        st.markdown("### ℹ️ About")
+        st.markdown("""
+        **Universal Indian Forest Phenology Predictor v5**  
+        Supports all forest types — Tropical, Evergreen, Shola, Mangrove, Himalayan, Alpine.  
+        100% data-driven · No hardcoded presets.
+        
+        [GitHub Repo](https://github.com/shreejisharma/Indian-forest-phenology)
+        """)
+    return ndvi_file, met_file, threshold_pct, window_days, r_thresh
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 0: DATA OVERVIEW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_data_overview():
+    st.markdown('<div class="section-header">📊 Data Characterization</div>', unsafe_allow_html=True)
+
+    ndvi_df = st.session_state.ndvi_df
+    met_df = st.session_state.met_df
+
+    if ndvi_df is None:
+        st.info("Upload NDVI CSV in the sidebar to begin.")
+        return
+
+    cadence = PhenologyEngine.detect_cadence(ndvi_df)
+    p5 = float(np.percentile(ndvi_df["NDVI"], 5))
+    p95 = float(np.percentile(ndvi_df["NDVI"], 95))
+    evergreen_idx = float(np.percentile(ndvi_df["NDVI"], 10))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Observations", len(ndvi_df))
+    col2.metric("Date Range", f"{ndvi_df['date'].dt.year.min()}–{ndvi_df['date'].dt.year.max()}")
+    col3.metric("Detected Cadence", f"{cadence} days")
+    col4.metric("NDVI P5–P95", f"{p5:.3f} – {p95:.3f}")
+    col5.metric("Evergreen Index (P10)", f"{evergreen_idx:.3f}",
+                help="P10 > 0.4 suggests evergreen forest")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 3.5), facecolor="#0e1117")
+    # NDVI histogram
+    axes[0].set_facecolor("#1e2530")
+    axes[0].hist(ndvi_df["NDVI"], bins=40, color="#22c55e", edgecolor="#374151", alpha=0.85)
+    axes[0].axvline(p5, color="#fbbf24", ls="--", lw=1.2, label=f"P5={p5:.3f}")
+    axes[0].axvline(p95, color="#f97316", ls="--", lw=1.2, label=f"P95={p95:.3f}")
+    axes[0].set_title("NDVI Distribution", color="#e5e7eb")
+    axes[0].tick_params(colors="#9ca3af")
+    axes[0].legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
+    for sp in axes[0].spines.values(): sp.set_edgecolor("#374151")
+
+    # Temporal plot
+    axes[1].set_facecolor("#1e2530")
+    axes[1].scatter(ndvi_df["date"], ndvi_df["NDVI"], s=8, color="#4ade80", alpha=0.6)
+    axes[1].set_title("NDVI Time Series", color="#e5e7eb")
+    axes[1].tick_params(colors="#9ca3af")
+    for sp in axes[1].spines.values(): sp.set_edgecolor("#374151")
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    if met_df is not None:
+        st.markdown('<div class="section-header">🌦️ Meteorological Parameters</div>', unsafe_allow_html=True)
+        excl = {"date", "YEAR", "DOY", "LAT", "LON", "ELEVATION", "PARAMETER"}
+        met_cols = [c for c in met_df.columns if c not in excl]
+        stats_rows = []
+        for c in met_cols:
+            vals = pd.to_numeric(met_df[c], errors="coerce").dropna()
+            if len(vals) == 0: continue
+            stats_rows.append({
+                "Parameter": c, "Count": len(vals),
+                "Mean": f"{vals.mean():.3f}", "Std": f"{vals.std():.3f}",
+                "Min": f"{vals.min():.3f}", "Max": f"{vals.max():.3f}",
+            })
+        if stats_rows:
+            st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Upload NASA POWER CSV to see meteorological summary.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1: TRAINING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_training(threshold_pct, window_days, r_thresh):
+    st.markdown('<div class="section-header">🔬 Phenology Extraction & Model Training</div>', unsafe_allow_html=True)
+
+    ndvi_df = st.session_state.ndvi_df
+    met_df = st.session_state.met_df
+
+    if ndvi_df is None:
+        st.info("Upload NDVI CSV to run extraction.")
+        return
+
+    run_col, _ = st.columns([1, 4])
+    run_btn = run_col.button("▶ Run Extraction & Train", type="primary", use_container_width=True)
+
+    if not run_btn and not st.session_state.trained:
+        return
+
+    if run_btn or not st.session_state.trained:
+        with st.spinner("Extracting phenology events…"):
+            cadence = PhenologyEngine.detect_cadence(ndvi_df)
+            seasons, smooth, all_days = PhenologyEngine.segment_seasons(ndvi_df, cadence)
+            pheno_df = PhenologyEngine.extract_events(seasons, smooth, all_days, ndvi_df, threshold_pct)
+            st.session_state.seasons = seasons
+            st.session_state.smooth = smooth
+            st.session_state.all_days = all_days
+            st.session_state.pheno_df = pheno_df
+
+        if pheno_df.empty:
+            st.error("No seasons extracted. Try lowering the threshold or check your data.")
+            return
+
+        # Met features
+        models_out = {}
+        corr_tables = {}
+        feature_df_list = []
+
+        if met_df is not None:
+            with st.spinner("Engineering met features & training models…"):
+                met_eng = PhenologyEngine.engineer_met_features(met_df)
+                st.session_state.met_eng = met_eng
+
+                all_feats = []
+                for _, row in pheno_df.iterrows():
+                    for event_col in ["SOS", "POS", "EOS"]:
+                        feats = PhenologyEngine.compute_window_features(met_eng, row[event_col], window_days)
+                        feats["year"] = row["year"]
+                        feats["event"] = event_col
+                        feats[f"{event_col}_DOY"] = row[f"{event_col}_DOY"]
+                        all_feats.append(feats)
+
+                feat_df = pd.DataFrame(all_feats)
+                st.session_state.feature_df = feat_df
+
+                for event in ["SOS", "POS", "EOS"]:
+                    sub = feat_df[feat_df["event"] == event].copy()
+                    y = sub[f"{event}_DOY"].astype(float)
+                    drop_cols = ["year", "event", "SOS_DOY", "POS_DOY", "EOS_DOY"]
+                    X_df = sub.drop(columns=[c for c in drop_cols if c in sub.columns], errors="ignore")
+                    X_df = X_df.apply(pd.to_numeric, errors="coerce").dropna(axis=1)
+                    y = y.loc[X_df.index]
+
+                    if len(y) < 3 or X_df.empty:
+                        continue
+
+                    # Correlations
+                    corr_rows = []
+                    for col in X_df.columns:
+                        if X_df[col].std() < 1e-9: continue
+                        try:
+                            r, _ = pearsonr(X_df[col], y)
+                            rho, _ = spearmanr(X_df[col], y)
+                            corr_rows.append({"feature": col, "pearson_r": r, "spearman_rho": rho,
+                                              "composite": (abs(r) + abs(rho)) / 2})
+                        except Exception:
+                            pass
+                    corr_df = pd.DataFrame(corr_rows).sort_values("composite", ascending=False)
+                    corr_tables[event] = corr_df
+
+                    # Feature selection
+                    selected = PhenologyEngine.select_features(X_df, y, r_thresh)
+                    if not selected:
+                        continue
+
+                    X_sel = X_df[selected].values
+                    y_arr = y.values
+
+                    mods = PhenologyEngine.fit_models(X_sel, y_arr)
+                    models_out[event] = {
+                        "models": mods, "selected": selected,
+                        "X_df": X_df, "y": y, "corr_df": corr_df,
+                    }
+
+        st.session_state.models = models_out
+        st.session_state.corr_tables = corr_tables
+        st.session_state.trained = True
+
+    # ── Display results ────────────────────────────────────────────────────
+    pheno_df = st.session_state.pheno_df
+    seasons = st.session_state.seasons
+    smooth = st.session_state.smooth
+    all_days = st.session_state.all_days
+
+    st.success(f"✅ Extracted **{len(pheno_df)}** growing seasons")
+
+    # NDVI overview plot
+    fig = plot_ndvi_overview(ndvi_df, seasons, smooth, all_days, pheno_df)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    # Phenology table
+    st.markdown('<div class="section-header">📋 Extracted Phenology Events</div>', unsafe_allow_html=True)
+    display_cols = ["year", "SOS_DOY", "POS_DOY", "EOS_DOY", "LOS", "Peak_NDVI", "Amplitude"]
+    st.dataframe(pheno_df[[c for c in display_cols if c in pheno_df.columns]],
+                 use_container_width=True, hide_index=True)
+    csv_pheno = pheno_df.to_csv(index=False).encode()
+    st.download_button("⬇ Download Phenology Table (CSV)", csv_pheno, "phenology_events.csv", "text/csv")
+
+    # Model results
+    models = st.session_state.models
+    if not models:
+        st.info("Upload NASA POWER meteorology CSV to train predictive models.")
+        return
+
+    st.markdown('<div class="section-header">🤖 Model Performance</div>', unsafe_allow_html=True)
+
+    all_coef_rows = []
+    for event, ev_data in models.items():
+        st.markdown(f"#### {event}")
+        mods = ev_data["models"]
+        selected = ev_data["selected"]
+        y = ev_data["y"]
+        X_df = ev_data["X_df"]
+
+        # Performance cards
+        cols = st.columns(len(mods))
+        best_r2 = -np.inf
+        best_name = None
+        for col, (mname, mres) in zip(cols, mods.items()):
+            r2 = mres["loo_r2"]
+            mae = mres["loo_mae"]
+            r2_str = f"{r2:.3f}" if not np.isnan(r2) else "N/A"
+            color = "#22c55e" if (not np.isnan(r2) and r2 > 0.6) else ("#f59e0b" if (not np.isnan(r2) and r2 > 0.3) else "#ef4444")
+            col.markdown(f"""
+            <div class="metric-card">
+                <b style="color:{color}">{mname}</b><br/>
+                LOO R² = <b style="color:{color}">{r2_str}</b><br/>
+                MAE = {mae:.1f} days<br/>
+                Features: {len(selected)}
+            </div>
+            """, unsafe_allow_html=True)
+            if not np.isnan(r2) and r2 > best_r2:
+                best_r2 = r2
+                best_name = mname
+
+        # Obs vs Pred for best model
+        best = mods.get(best_name or list(mods.keys())[0])
+        if best and "scaler" in best and best["scaler"] is not None:
+            Xs = best["scaler"].transform(X_df[selected].values)
+            y_pred = best["model"].predict(Xs)
+        else:
+            try:
+                y_pred = best["model"].predict(X_df[selected].values)
+            except Exception:
+                y_pred = np.full(len(y), y.mean())
+
+        fig_sc = plot_obs_pred(y.values, y_pred, event, best["loo_r2"], best["loo_mae"])
+        c1, c2 = st.columns([1, 2])
+        c1.pyplot(fig_sc, use_container_width=True)
+        plt.close(fig_sc)
+
+        # Feature role table
+        corr_df = ev_data["corr_df"]
+        corr_df = corr_df.copy()
+        corr_df["role"] = corr_df.apply(
+            lambda r: "✅ IN MODEL" if r["feature"] in selected
+            else ("⬇ Below threshold" if r["composite"] < r_thresh else "🔶 Not selected (collinear)"),
+            axis=1
+        )
+        with c2:
+            st.dataframe(corr_df[["feature", "pearson_r", "spearman_rho", "composite", "role"]]
+                         .head(12).style.format({"pearson_r": "{:.3f}", "spearman_rho": "{:.3f}", "composite": "{:.3f}"}),
+                         use_container_width=True, hide_index=True)
+
+        # Ridge coefficients
+        ridge_res = mods.get("Ridge")
+        if ridge_res and ridge_res["coefs"] is not None:
+            eq_parts = [f"{ridge_res['intercept']:.2f}"]
+            for feat, coef in zip(selected, ridge_res["coefs"]):
+                eq_parts.append(f"{coef:+.3f}×{feat}")
+            st.markdown(f"**Ridge equation:** `{event}_DOY = {' '.join(eq_parts)}`")
+            for feat, coef in zip(selected, ridge_res["coefs"]):
+                all_coef_rows.append({"event": event, "model": "Ridge", "feature": feat, "coefficient": coef})
+            all_coef_rows.append({"event": event, "model": "Ridge", "feature": "intercept", "coefficient": ridge_res["intercept"]})
+
+    if all_coef_rows:
+        coef_csv = pd.DataFrame(all_coef_rows).to_csv(index=False).encode()
+        st.download_button("⬇ Download Model Coefficients (CSV)", coef_csv, "model_coefficients.csv", "text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2: CORRELATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_correlations():
+    st.markdown('<div class="section-header">📈 Feature Correlations</div>', unsafe_allow_html=True)
+
+    corr_tables = st.session_state.corr_tables
+    if not corr_tables:
+        st.info("Run Training first to compute correlations.")
+        return
+
+    event = st.selectbox("Phenology Event", list(corr_tables.keys()))
+    corr_df = corr_tables[event]
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        fig = plot_correlation_bar(corr_df.head(20), event)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+    feat_df = st.session_state.feature_df
+    if feat_df is not None:
+        top_feats = corr_df.head(8)["feature"].tolist()
+        sub = feat_df[feat_df["event"] == event]
+        available = [f for f in top_feats if f in sub.columns]
+        if len(available) >= 2:
+            with col2:
+                fig_hm = plot_corr_heatmap(sub[available].apply(pd.to_numeric, errors="coerce").dropna())
+                st.pyplot(fig_hm, use_container_width=True)
+                plt.close(fig_hm)
+
+    # Year-by-year NDVI + met overlays
+    st.markdown('<div class="section-header">📅 Annual NDVI + Meteorology</div>', unsafe_allow_html=True)
+    ndvi_df = st.session_state.ndvi_df
+    met_eng = st.session_state.met_eng
+    pheno_df = st.session_state.pheno_df
+
+    if ndvi_df is None or pheno_df is None:
+        return
+
+    years = sorted(pheno_df["year"].unique())
+    sel_year = st.selectbox("Select Year", years)
+    row = pheno_df[pheno_df["year"] == sel_year]
+
+    t0 = pd.Timestamp(f"{sel_year - 1}-07-01")
+    t1 = pd.Timestamp(f"{sel_year + 1}-06-30")
+    yr_ndvi = ndvi_df[(ndvi_df["date"] >= t0) & (ndvi_df["date"] <= t1)]
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 6), facecolor="#0e1117", sharex=True)
+    for ax in axes:
+        ax.set_facecolor("#1e2530")
+        for sp in ax.spines.values(): sp.set_edgecolor("#374151")
+        ax.tick_params(colors="#9ca3af")
+
+    axes[0].scatter(yr_ndvi["date"], yr_ndvi["NDVI"], s=18, color="#4ade80", alpha=0.8, label="NDVI")
+    if not row.empty:
+        r = row.iloc[0]
+        axes[0].axvline(r["SOS"], color=PALETTE["sos"], lw=1.5, ls="--", label=f"SOS DOY={r['SOS_DOY']}")
+        axes[0].axvline(r["POS"], color=PALETTE["pos"], lw=1.5, ls="-.", label=f"POS DOY={r['POS_DOY']}")
+        axes[0].axvline(r["EOS"], color=PALETTE["eos"], lw=1.5, ls=":", label=f"EOS DOY={r['EOS_DOY']}")
+    axes[0].set_ylabel("NDVI", color="#9ca3af")
+    axes[0].legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
+    axes[0].set_title(f"Year {sel_year}", color="#e5e7eb", fontsize=11)
+
+    if met_eng is not None:
+        yr_met = met_eng[(met_eng["date"] >= t0) & (met_eng["date"] <= t1)]
+        met_plot_cols = [c for c in ["T2M", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN"] if c in yr_met.columns][:3]
+        colors_m = ["#f97316", "#3b82f6", "#fbbf24"]
+        for col, clr in zip(met_plot_cols, colors_m):
+            vals = pd.to_numeric(yr_met[col], errors="coerce")
+            axes[1].plot(yr_met["date"], vals, color=clr, lw=1.5, alpha=0.8, label=col)
+    axes[1].set_ylabel("Meteorology", color="#9ca3af")
+    axes[1].set_xlabel("Date", color="#9ca3af")
+    axes[1].legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3: PREDICT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_predict():
+    st.markdown('<div class="section-header">🔮 Predict Phenology Events</div>', unsafe_allow_html=True)
+
+    models = st.session_state.models
+    if not models:
+        st.info("Run Training with meteorology data to enable predictions.")
+        return
+
+    feat_df = st.session_state.feature_df
+    pred_rows = []
+
+    for event in ["SOS", "POS", "EOS"]:
+        if event not in models:
+            continue
+        ev = models[event]
+        selected = ev["selected"]
+        X_df = ev["X_df"]
+        y = ev["y"]
+
+        st.markdown(f"#### {event} — Selected features: `{', '.join(selected)}`")
+
+        # Pre-fill with training means
+        inputs = {}
+        cols = st.columns(min(len(selected), 4))
+        for i, feat in enumerate(selected):
+            train_mean = float(X_df[feat].mean())
+            train_min = float(X_df[feat].min())
+            train_max = float(X_df[feat].max())
+            val = cols[i % 4].number_input(
+                f"{feat}", value=round(train_mean, 3),
+                help=f"Training range: {train_min:.2f} – {train_max:.2f}",
+                key=f"pred_{event}_{feat}"
+            )
+            inputs[feat] = val
+
+        best_mods = ev["models"]
+        best_name = max(best_mods.keys(),
+                        key=lambda k: best_mods[k]["loo_r2"] if not np.isnan(best_mods[k]["loo_r2"]) else -999)
+        best = best_mods[best_name]
+
+        X_pred = np.array([[inputs[f] for f in selected]])
+        if best["scaler"] is not None:
+            # scale using training X
+            sc = best["scaler"]
+            X_pred_s = sc.transform(X_pred)
+        else:
+            X_pred_s = X_pred
+
+        try:
+            pred_val = float(best["model"].predict(X_pred_s)[0])
+        except Exception:
+            pred_val = float(y.mean())
+
+        pred_date = pd.Timestamp(f"{pd.Timestamp.now().year}-01-01") + pd.Timedelta(days=int(pred_val) - 1)
+        r2_str = f"{best['loo_r2']:.3f}" if not np.isnan(best["loo_r2"]) else "N/A"
+
+        st.markdown(f"""
+        <div class="highlight-box">
+        🎯 <b>Predicted {event}</b>: DOY <b style="color:#22c55e;font-size:1.3rem">{pred_val:.1f}</b>
+        &nbsp;|&nbsp; ≈ <b>{pred_date.strftime("%d %b")}</b>
+        &nbsp;|&nbsp; Model: <b>{best_name}</b> (LOO R²={r2_str})
+        </div>
+        """, unsafe_allow_html=True)
+
+        pred_rows.append({"Event": event, "Predicted_DOY": round(pred_val, 1),
+                          "Approx_Date": pred_date.strftime("%d-%b"),
+                          "Model": best_name, "LOO_R2": r2_str})
+
+    if pred_rows:
+        pred_df = pd.DataFrame(pred_rows)
+        # Ecological order check
+        if len(pred_df) == 3:
+            sos_v = pred_df.loc[pred_df["Event"] == "SOS", "Predicted_DOY"].values[0]
+            pos_v = pred_df.loc[pred_df["Event"] == "POS", "Predicted_DOY"].values[0]
+            eos_v = pred_df.loc[pred_df["Event"] == "EOS", "Predicted_DOY"].values[0]
+            if not (sos_v < pos_v < eos_v):
+                st.warning("⚠️ Predicted order SOS < POS < EOS violated — check input feature values.")
+
+        st.markdown('<div class="section-header">📋 Prediction Summary</div>', unsafe_allow_html=True)
+        st.dataframe(pred_df, use_container_width=True, hide_index=True)
+        pred_csv = pred_df.to_csv(index=False).encode()
+        st.download_button("⬇ Download Predictions (CSV)", pred_csv, "predictions.csv", "text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4: TECHNICAL GUIDE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tab_technical_guide():
     st.markdown("""
-## What's New in v6 — Monsoon-Aware Design
+    ## 📖 Technical Guide
 
-### 🔑 The Core Problem with v5 on Indian Sites
-In v5, **T2M always dominated** every phenological metric. Here's why this is wrong for tropical Indian forests:
+    ### Phenology Extraction Methodology (v5 — 100% Data-Driven)
 
-| Issue | v5 Behaviour | v6 Fix |
-|-------|-------------|--------|
-| T2M variation | 24.15–24.82°C (< 0.7°C range) | Variance-weighted ranking — low-CV features down-ranked |
-| PRECTOTCORR dropped | Dropped because |r| > 0.85 with T2M | Moisture protection flag — PRECTOTCORR/RH2M survive collinearity filter |
-| GDD_cum leakage | Used as predictor | Excluded from forward selection (leakage guard) |
-| Short windows | 30d default misses monsoon signal | 60/90d default for SOS |
-| Precipitation = mean | Mean of 5-day totals | Sum = actual accumulation (physically correct) |
+    | Step | Parameter | v5 Method |
+    |---|---|---|
+    | 1 | NDVI cadence | Median of observed date differences |
+    | 2 | Max gap threshold | 8× detected cadence |
+    | 3 | Trough min distance | 40% of autocorrelation cycle estimate |
+    | 4 | MIN_AMPLITUDE | 5% of data P5–P95 range |
+    | 5 | SG window | ≤ 31 steps per segment |
+    | 6 | SOS / EOS | user% × per-cycle amplitude |
+    | 7 | POS | Raw NDVI maximum between SOS and EOS |
+    | 8 | Season year | Trough start year (eliminates duplicate-year collision) |
 
----
+    ---
 
-### 🌧️ Correct Causal Drivers for Indian Monsoon Forests
+    ### Feature Selection Pipeline
 
-**SOS (Start of Season / Green-up)**
-- **PRIMARY:** `PRECTOTCORR_sum` over 60–90d — monsoon onset triggers green-up
-- **SECONDARY:** `SPEI_proxy` — moisture surplus/deficit signal
-- **SECONDARY:** `RH2M` — humidity rise confirms monsoon arrival
-- **NOT:** T2M (range < 1°C = no explanatory power for timing differences)
+    ```
+    1. Compute Pearson r + Spearman ρ composite per feature
+    2. Filter: composite ≥ user-defined threshold (default 0.40)
+    3. Collinearity removal: if |r| > 0.85 between two features → drop weaker one
+    4. Forward selection: add feature only if LOO R² improves ≥ 0.03
+    ```
 
-**POS (Peak of Season)**
-- **PRIMARY:** Cumulative seasonal precipitation total
-- **PRIMARY:** `RH2M` sustained during growing season
-- **SECONDARY:** `ALLSKY_SFC_SW_DWN` — solar radiation modulates photosynthetic rate
+    ---
 
-**EOS (End of Season / Senescence)**
-- **PRIMARY:** `WS2M` — dry post-monsoon winds
-- **PRIMARY:** `VPD` — vapour pressure deficit (moisture stress)
-- **SECONDARY:** Precipitation cessation (`PRECTOTCORR_sum` approaching 0)
+    ### Model Summary
 
----
+    | Model | Notes |
+    |---|---|
+    | **Ridge** | L2-regularized linear; best for small n, collinear features |
+    | **Polynomial deg-2/3** | Captures nonlinear driver responses |
+    | **GPR** | Gaussian Process; uncertainty-aware; requires n ≥ 5 |
 
-### 📐 Feature Selection Algorithm (v6)
-1. Compute Pearson |r| + Spearman |ρ| composite
-2. **Variance weight**: if CV < 2%, composite × 0.5 (down-ranks T2M etc.)
-3. **Leakage exclusion**: GDD_cum excluded from candidate set
-4. **Collinearity filter** with moisture protection:
-   - If PRECTOTCORR/RH2M is collinear with T2M → **keep moisture, drop T2M**
-5. Forward LOO R² selection (add feature if ΔR² ≥ 0.03)
+    All models are evaluated with **Leave-One-Out Cross-Validation (LOO-CV)**.
 
----
+    ---
 
-### ⚠️ Known Limitations
-- Only 3 complete seasons → wide confidence intervals (t-distribution, df=1)
-- 19-year extrapolation to 2026 → large uncertainty
-- Linear trend assumption may not hold under non-stationary climate
-- Consider adding more years of data for reliable predictions
+    ### R² Interpretation
 
----
+    | LOO R² | Interpretation |
+    |---|---|
+    | > 0.80 | Excellent — strong environmental control |
+    | 0.60 – 0.80 | Good — reliable predictions |
+    | 0.40 – 0.60 | Moderate — useful but uncertain |
+    | < 0.40 | Weak — more seasons needed or key driver missing |
 
-### 📚 Citation
-```
-Sharma, S. (2025). Universal Indian Forest Phenology Predictor v6 [Software].
-GitHub. https://github.com/shreejisharma/Indian-forest-phenology
-```
-""")
+    ---
+
+    ### Derived Meteorological Features
+
+    | Feature | Derivation |
+    |---|---|
+    | `GDD_5` | (T2M − 5)⁺ |
+    | `GDD_10` | (T2M − 10)⁺ |
+    | `GDD_cum` | Cumulative GDD_5 |
+    | `DTR` | T2M_MAX − T2M_MIN |
+    | `VPD` | es × (1 − RH2M/100) |
+    | `log_precip` | log(1 + PRECTOTCORR) |
+    | `MSI` | Solar / (Precip + 1) |
+    | `SPEI_proxy` | Precip − PET (simplified Hargreaves) |
+
+    ---
+
+    ### Citation
+    ```
+    Sharma, S. (2025). Universal Indian Forest Phenology Predictor v5 [Software].
+    GitHub. https://github.com/shreejisharma/Indian-forest-phenology
+    ```
+
+    ---
+
+    ### License
+    MIT License
+    """)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    init_state()
+    ndvi_file, met_file, threshold_pct, window_days, r_thresh = render_sidebar()
+
+    # Load data on upload
+    if ndvi_file is not None:
+        try:
+            ndvi_df = PhenologyEngine.load_ndvi(ndvi_file)
+            if st.session_state.ndvi_df is None or len(ndvi_df) != len(st.session_state.ndvi_df):
+                st.session_state.ndvi_df = ndvi_df
+                st.session_state.trained = False
+        except Exception as e:
+            st.sidebar.error(f"NDVI load error: {e}")
+
+    if met_file is not None:
+        try:
+            met_df = PhenologyEngine.load_met(met_file)
+            if st.session_state.met_df is None or len(met_df) != len(st.session_state.met_df):
+                st.session_state.met_df = met_df
+                st.session_state.trained = False
+        except Exception as e:
+            st.sidebar.error(f"Met load error: {e}")
+
+    # Header
+    st.markdown("""
+    <h1 style="color:#22c55e;font-size:1.8rem;margin-bottom:0">
+        🌲 Universal Indian Forest Phenology Predictor — v5
+    </h1>
+    <p style="color:#9ca3af;margin-top:4px;margin-bottom:16px">
+        100% Data-Driven · All Indian Forest Types · SOS · POS · EOS · LOS
+    </p>
+    """, unsafe_allow_html=True)
+
+    # Status bar
+    ndvi_ok = st.session_state.ndvi_df is not None
+    met_ok = st.session_state.met_df is not None
+    trained_ok = st.session_state.trained
+    cols = st.columns(3)
+    cols[0].markdown(f"{'✅' if ndvi_ok else '⬜'} **NDVI** {'loaded' if ndvi_ok else 'not uploaded'}")
+    cols[1].markdown(f"{'✅' if met_ok else '⬜'} **Meteorology** {'loaded' if met_ok else 'not uploaded'}")
+    cols[2].markdown(f"{'✅' if trained_ok else '⬜'} **Models** {'trained' if trained_ok else 'not run'}")
+
+    # Tabs
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Data Overview",
+        "🔬 Training",
+        "📈 Correlations",
+        "🔮 Predict",
+        "📖 Technical Guide",
+    ])
+
+    with tab0:
+        tab_data_overview()
+    with tab1:
+        tab_training(threshold_pct, window_days, r_thresh)
+    with tab2:
+        tab_correlations()
+    with tab3:
+        tab_predict()
+    with tab4:
+        tab_technical_guide()
+
+
+if __name__ == "__main__":
+    main()
