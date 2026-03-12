@@ -262,23 +262,25 @@ class PhenologyEngine:
         """
         Segment NDVI time series into individual growing seasons.
 
-        Key improvements in v5.2:
-        - Per-cycle local vmin/vmax for threshold (not global) → each cycle's
-          threshold is computed from its own trough-to-trough segment.
-        - Multi-pass trough detection: strict → relaxed → last resort.
-        - Minimum segment length = 20% of detected cycle (prevents micro-cycles).
-        - amplitude_pct stored in each season dict so extract_events can use it.
+        v5.3 changes:
+        - Always interpolate to a fixed 5-day grid (regardless of original
+          cadence) so SG smoothing is consistent across MODIS/Sentinel/etc.
+        - SG window operates on 5-day steps (31 steps ≈ 155 days max).
+        - Per-cycle local vmin/vmax threshold (v5.2) retained.
+        - Multi-pass trough detection (v5.2) retained.
         """
+        INTERP_STEP = 5   # fixed 5-day grid
+
         dates    = ndvi_df["date"].values
         ndvi_raw = ndvi_df["NDVI"].values.copy()
 
-        # ── Regular grid interpolation ────────────────────────────────────
+        # ── 5-day regular grid interpolation ─────────────────────────────
         date_nums = (pd.DatetimeIndex(dates) - pd.Timestamp("2000-01-01")).days.values
-        all_days  = np.arange(date_nums[0], date_nums[-1] + 1, cadence)
+        all_days  = np.arange(date_nums[0], date_nums[-1] + 1, INTERP_STEP)
         f_interp  = interp1d(date_nums, ndvi_raw, bounds_error=False, fill_value=np.nan)
         ndvi_interp = f_interp(all_days)
 
-        # ── SG smoothing (window ≤ 31 steps, per v5 spec) ────────────────
+        # ── SG smoothing on 5-day grid (window ≤ 31 steps = ≤ 155 days) ──
         n      = len(ndvi_interp)
         sg_win = min(31, n if n % 2 == 1 else n - 1)
         sg_win = max(sg_win, 5)
@@ -287,10 +289,10 @@ class PhenologyEngine:
             sg_win, 3
         )
 
-        # ── Cycle-length detection ────────────────────────────────────────
-        cycle_len       = PhenologyEngine.detect_cycle_length(smooth, cadence)
-        min_trough_dist = max(10, int(0.40 * cycle_len / cadence))
-        min_seg_steps   = max(5, int(0.20 * cycle_len / cadence))  # new guard
+        # ── Cycle-length detection on 5-day grid ─────────────────────────
+        cycle_len       = PhenologyEngine.detect_cycle_length(smooth, INTERP_STEP)
+        min_trough_dist = max(10, int(0.40 * cycle_len / INTERP_STEP))
+        min_seg_steps   = max(5,  int(0.20 * cycle_len / INTERP_STEP))
 
         # ── Global amplitude floor (5% of P5–P95 range) ──────────────────
         p5, p95  = np.nanpercentile(ndvi_raw, 5), np.nanpercentile(ndvi_raw, 95)
@@ -913,17 +915,32 @@ def render_sidebar():
                                     help="NASA POWER daily export — headers auto-detected")
         st.markdown("---")
         st.markdown("### ⚙️ Parameters")
-        threshold_pct = st.slider("SOS/EOS threshold (% amplitude)", 10, 50, 25, 5,
-                                   help="50% amplitude threshold = standard half-max method") / 100
-        window_days = st.slider("Meteorological window (days before event)", 15, 90, 30, 5)
-        r_thresh = st.slider("Feature selection |r| threshold", 0.20, 0.70, 0.40, 0.05)
+
+        threshold_pct = st.slider(
+            "SOS/EOS threshold (% amplitude)", 10, 50, 10, 5,
+            help=(
+                "Threshold = local_vmin + pct% × (local_vmax − local_vmin) per cycle.\n"
+                "10% = very sensitive (picks up early green-up).\n"
+                "50% = half-max method (standard)."
+            )
+        ) / 100
+
+        window_days = st.slider(
+            "Meteorological window (days before event)", 5, 30, 15, 5,
+            help="Number of days before each phenological event to average met variables."
+        )
+
+        r_thresh = st.slider(
+            "Feature selection |r| threshold", 0.20, 0.70, 0.40, 0.05,
+            help="Minimum |Pearson r| for a met variable to enter the model."
+        )
+
         st.markdown("---")
         st.markdown("### ℹ️ About")
         st.markdown("""
         **Universal Indian Forest Phenology Predictor v5**  
-        Supports all forest types — Tropical, Evergreen, Shola, Mangrove, Himalayan, Alpine.  
-        100% data-driven · No hardcoded presets.
-        
+        All forest types · 5-day interpolation · Per-cycle adaptive threshold.
+
         [GitHub Repo](https://github.com/shreejisharma/Indian-forest-phenology)
         """)
     return ndvi_file, met_file, threshold_pct, window_days, r_thresh
@@ -1232,47 +1249,133 @@ def tab_correlations():
 
     # Year-by-year NDVI + met overlays
     st.markdown('<div class="section-header">📅 Annual NDVI + Meteorology</div>', unsafe_allow_html=True)
-    ndvi_df = st.session_state.ndvi_df
-    met_eng = st.session_state.met_eng
+    ndvi_df  = st.session_state.ndvi_df
+    met_eng  = st.session_state.met_eng
     pheno_df = st.session_state.pheno_df
+    smooth   = st.session_state.smooth
+    all_days = st.session_state.all_days
 
     if ndvi_df is None or pheno_df is None:
         return
 
-    years = sorted(pheno_df["year"].unique())
+    years    = sorted(pheno_df["year"].unique())
     sel_year = st.selectbox("Select Year", years)
-    row = pheno_df[pheno_df["year"] == sel_year]
+    row      = pheno_df[pheno_df["year"] == sel_year]
 
+    # Date window: July prev-year → July next-year (full growing season)
     t0 = pd.Timestamp(f"{sel_year - 1}-07-01")
     t1 = pd.Timestamp(f"{sel_year + 1}-06-30")
-    yr_ndvi = ndvi_df[(ndvi_df["date"] >= t0) & (ndvi_df["date"] <= t1)]
 
-    fig, axes = plt.subplots(2, 1, figsize=(13, 6), facecolor="#0e1117", sharex=True)
+    # Raw NDVI scatter within window
+    yr_ndvi = ndvi_df[(ndvi_df["date"] >= t0) & (ndvi_df["date"] <= t1)].copy()
+
+    # 5-day interpolated + smoothed NDVI for the window
+    base = pd.Timestamp("2000-01-01")
+    day0 = (t0 - base).days
+    day1 = (t1 - base).days
+    mask_smooth = (all_days >= day0) & (all_days <= day1)
+    smooth_days_win = all_days[mask_smooth]
+    smooth_vals_win = smooth[mask_smooth]
+    smooth_dates_win = pd.to_datetime(
+        [base + pd.Timedelta(days=int(d)) for d in smooth_days_win]
+    )
+
+    # ── Figure: 2 stacked subplots ────────────────────────────────────────
+    fig, axes = plt.subplots(2, 1, figsize=(13, 7), facecolor="#0e1117",
+                             sharex=True, gridspec_kw={"height_ratios": [1.4, 1]})
     for ax in axes:
         ax.set_facecolor("#1e2530")
-        for sp in ax.spines.values(): sp.set_edgecolor("#374151")
-        ax.tick_params(colors="#9ca3af")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#374151")
+        ax.tick_params(colors="#9ca3af", labelsize=9)
 
-    axes[0].scatter(yr_ndvi["date"], yr_ndvi["NDVI"], s=18, color="#4ade80", alpha=0.8, label="NDVI")
+    # ── Top: NDVI ─────────────────────────────────────────────────────────
+    ax0 = axes[0]
+    # Raw scatter
+    ax0.scatter(yr_ndvi["date"], yr_ndvi["NDVI"],
+                s=22, color="#4ade80", alpha=0.80, zorder=3, label="NDVI (raw)")
+    # 5-day smooth
+    ax0.plot(smooth_dates_win, smooth_vals_win,
+             color="#a7f3d0", lw=2.0, zorder=4, label="5-day SG smooth")
+
     if not row.empty:
         r = row.iloc[0]
-        axes[0].axvline(r["SOS"], color=PALETTE["sos"], lw=1.5, ls="--", label=f"SOS DOY={r['SOS_DOY']}")
-        axes[0].axvline(r["POS"], color=PALETTE["pos"], lw=1.5, ls="-.", label=f"POS DOY={r['POS_DOY']}")
-        axes[0].axvline(r["EOS"], color=PALETTE["eos"], lw=1.5, ls=":", label=f"EOS DOY={r['EOS_DOY']}")
-    axes[0].set_ylabel("NDVI", color="#9ca3af")
-    axes[0].legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
-    axes[0].set_title(f"Year {sel_year}", color="#e5e7eb", fontsize=11)
+        # Threshold line for this year
+        if "Threshold" in row.columns:
+            thr = float(r["Threshold"])
+            ax0.hlines(thr, t0, t1, colors="#f59e0b", lw=1.2, ls=":",
+                       alpha=0.80, label=f"Threshold={thr:.3f}")
+        ax0.axvline(r["SOS"], color=PALETTE["sos"], lw=1.8, ls="--",
+                    label=f"SOS  DOY={int(r['SOS_DOY'])}")
+        ax0.axvline(r["POS"], color=PALETTE["pos"], lw=1.8, ls="-.",
+                    label=f"POS  DOY={int(r['POS_DOY'])}")
+        ax0.axvline(r["EOS"], color=PALETTE["eos"], lw=1.8, ls=":",
+                    label=f"EOS  DOY={int(r['EOS_DOY'])}")
 
+    ax0.set_ylabel("NDVI", color="#9ca3af", fontsize=10)
+    ax0.set_title(f"Year {sel_year}  —  5-day interpolated NDVI + Meteorology",
+                  color="#e5e7eb", fontsize=11, pad=8)
+    ax0.legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb",
+               fontsize=8, loc="upper left", ncol=2)
+    ax0.set_ylim(bottom=0)
+
+    # ── Bottom: Meteorology ───────────────────────────────────────────────
+    ax1 = axes[1]
     if met_eng is not None:
-        yr_met = met_eng[(met_eng["date"] >= t0) & (met_eng["date"] <= t1)]
-        met_plot_cols = [c for c in ["T2M", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN"] if c in yr_met.columns][:3]
-        colors_m = ["#f97316", "#3b82f6", "#fbbf24"]
-        for col, clr in zip(met_plot_cols, colors_m):
-            vals = pd.to_numeric(yr_met[col], errors="coerce")
-            axes[1].plot(yr_met["date"], vals, color=clr, lw=1.5, alpha=0.8, label=col)
-    axes[1].set_ylabel("Meteorology", color="#9ca3af")
-    axes[1].set_xlabel("Date", color="#9ca3af")
-    axes[1].legend(facecolor="#1e2530", edgecolor="#374151", labelcolor="#e5e7eb", fontsize=8)
+        yr_met = met_eng[(met_eng["date"] >= t0) & (met_eng["date"] <= t1)].copy()
+
+        # Priority order: T2M (temp), PRECTOTCORR (rain), ALLSKY (solar)
+        # Each on its own scale — use twin axes for T2M vs rain+solar
+        met_vars = []
+        for v in ["T2M", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN",
+                  "RH2M", "WS2M", "GWETTOP", "GWETROOT"]:
+            if v in yr_met.columns:
+                vals = pd.to_numeric(yr_met[v], errors="coerce")
+                if vals.notna().sum() > 5:
+                    met_vars.append(v)
+
+        MET_COLORS = {
+            "T2M":               "#f97316",
+            "PRECTOTCORR":       "#3b82f6",
+            "ALLSKY_SFC_SW_DWN": "#fbbf24",
+            "RH2M":              "#a78bfa",
+            "WS2M":              "#34d399",
+            "GWETTOP":           "#60a5fa",
+            "GWETROOT":          "#818cf8",
+        }
+        MET_LABELS = {
+            "T2M":               "T2M (°C)",
+            "PRECTOTCORR":       "Precipitation (mm/d)",
+            "ALLSKY_SFC_SW_DWN": "Solar (MJ/m²/d)",
+            "RH2M":              "RH2M (%)",
+            "WS2M":              "Wind (m/s)",
+            "GWETTOP":           "Soil Wet. (top)",
+            "GWETROOT":          "Soil Wet. (root)",
+        }
+
+        for v in met_vars[:5]:   # limit to 5 variables for readability
+            vals = pd.to_numeric(yr_met[v], errors="coerce")
+            ax1.plot(yr_met["date"], vals,
+                     color=MET_COLORS.get(v, "#9ca3af"),
+                     lw=1.4, alpha=0.85,
+                     label=MET_LABELS.get(v, v))
+
+        ax1.legend(facecolor="#1e2530", edgecolor="#374151",
+                   labelcolor="#e5e7eb", fontsize=8, loc="upper left", ncol=3)
+    else:
+        ax1.text(0.5, 0.5, "Upload NASA POWER met file to see meteorology",
+                 transform=ax1.transAxes, color="#9ca3af", ha="center", va="center")
+
+    ax1.set_ylabel("Meteorology", color="#9ca3af", fontsize=10)
+    ax1.set_xlabel("Date", color="#9ca3af", fontsize=10)
+
+    # SOS/POS/EOS lines on met panel too
+    if not row.empty:
+        r = row.iloc[0]
+        ax1.axvline(r["SOS"], color=PALETTE["sos"], lw=1.2, ls="--", alpha=0.5)
+        ax1.axvline(r["POS"], color=PALETTE["pos"], lw=1.2, ls="-.", alpha=0.5)
+        ax1.axvline(r["EOS"], color=PALETTE["eos"], lw=1.2, ls=":",  alpha=0.5)
+
     plt.tight_layout()
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
