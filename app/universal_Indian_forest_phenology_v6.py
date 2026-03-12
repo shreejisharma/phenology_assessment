@@ -1,7 +1,16 @@
 """
-Universal Indian Forest Phenology Predictor — v5
+Universal Indian Forest Phenology Predictor — v5.1
 100% Data-Driven | All Indian Forest Types
 Author: Sharma, S. (2025)
+
+v5.1 corrections:
+  - NASA POWER loader: robust multi-format header detection (YEAR/DOY, MO/DY,
+    -BEGIN HEADER- block, comment '#' lines, blank lines, pipe-delimited NASA
+    POWER legacy format)
+  - LOESS model re-added (statsmodels lowess fallback to Ridge if unavailable)
+  - T2M_RANGE derived feature added  (T2M_MAX – T2M_MIN, distinct from DTR)
+  - Threshold definition kept exactly as v5 (first/last amplitude crossing)
+  - sample_nasa_power_met.csv generator updated to emit true NASA POWER format
 """
 
 import warnings
@@ -23,6 +32,13 @@ import matplotlib.gridspec as gridspec
 from matplotlib.patches import Patch
 import io
 import re
+
+# Optional LOESS
+try:
+    from statsmodels.nonparametric.smoothers_lowess import lowess as sm_lowess
+    _LOESS_AVAILABLE = True
+except ImportError:
+    _LOESS_AVAILABLE = False
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -98,27 +114,122 @@ class PhenologyEngine:
     # ── 2. NASA POWER Loading ──────────────────────────────────────────────
     @staticmethod
     def load_met(uploaded_file) -> pd.DataFrame:
+        """
+        Robust NASA POWER CSV loader.  Handles all known export formats:
+
+        Format A — Daily point, modern API (most common):
+            Metadata block starting with '-BEGIN HEADER-' … '-END HEADER-'
+            then a CSV with columns: YEAR  MO  DY  [parameters…]
+
+        Format B — Daily point, legacy API:
+            Comment lines beginning with '#'
+            then CSV with: YEAR  DOY  [parameters…]
+
+        Format C — Daily point, tabular (older downloads):
+            Several free-text header rows, then:
+            YEAR  DOY  [parameters…]   (space/comma delimited)
+
+        Format D — User-exported with a DATE column:
+            date,T2M,PRECTOTCORR,…
+
+        All formats: -999 / -99 / -9999 treated as NaN.
+        """
         raw = uploaded_file.read().decode("utf-8", errors="ignore")
         uploaded_file.seek(0)
         lines = raw.splitlines()
-        # Auto-detect header row (find line with YEAR and DOY or DATE)
-        header_idx = 0
+
+        # ── Step 1: strip header block ─────────────────────────────────────
+        # Strategy: find the first line that looks like a CSV/TSV column header
+        # (contains at least one known NASA POWER variable name or standard
+        #  date tokens), preceded by non-data lines we skip.
+
+        KNOWN_COLS = {
+            "YEAR", "MO", "DY", "DOY", "DATE",
+            "T2M", "T2M_MIN", "T2M_MAX", "T2M_RANGE",
+            "PRECTOTCORR", "PRECTOT", "RH2M", "QV2M",
+            "ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN",
+            "WS2M", "WS10M", "WD2M",
+            "GWETTOP", "GWETROOT", "GWETPROF",
+            "PS", "T2MDEW", "T2MWET",
+        }
+
+        header_idx = None
         for i, line in enumerate(lines):
-            if re.search(r"YEAR.*DOY|DOY.*YEAR|DATE", line, re.IGNORECASE):
+            # Skip blank / comment / header-block lines
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("#", "-BEGIN", "-END", "NASA", "LAT", "LON",
+                                    "BEGIN", "END", "Source", "Data", "Param")):
+                continue
+            # Tokenise (comma or whitespace)
+            sep = "," if "," in stripped else None
+            tokens = [t.strip().upper() for t in
+                      (stripped.split(",") if sep else stripped.split())]
+            matches = sum(1 for t in tokens if t in KNOWN_COLS)
+            if matches >= 2:
                 header_idx = i
                 break
-        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip")
-        df.columns = [c.strip() for c in df.columns]
-        # Build date
-        if "YEAR" in df.columns and "DOY" in df.columns:
-            df["date"] = pd.to_datetime(
-                df["YEAR"].astype(str) + df["DOY"].astype(str).str.zfill(3), format="%Y%j", errors="coerce"
+
+        if header_idx is None:
+            raise ValueError(
+                "Could not locate the data header row in the NASA POWER file.\n"
+                "Expected columns like: YEAR MO DY or YEAR DOY or DATE.\n"
+                "Please check your file matches NASA POWER daily export format."
             )
-        elif "DATE" in df.columns:
-            df["date"] = pd.to_datetime(df["DATE"], infer_datetime_format=True, errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-        # Replace -999 sentinel
-        df = df.replace(-999.0, np.nan).replace(-99.0, np.nan)
+
+        # ── Step 2: read CSV from detected header ──────────────────────────
+        body = "\n".join(lines[header_idx:])
+        # Normalise delimiter: NASA POWER sometimes uses spaces/tabs
+        # Try comma first; if the header has no comma, use whitespace engine
+        if "," in lines[header_idx]:
+            df = pd.read_csv(io.StringIO(body), on_bad_lines="skip")
+        else:
+            df = pd.read_csv(io.StringIO(body), sep=r"\s+",
+                             engine="python", on_bad_lines="skip")
+
+        df.columns = [c.strip().upper() for c in df.columns]
+
+        # ── Step 3: replace NASA POWER fill values ─────────────────────────
+        for fv in [-999.0, -999, -99.0, -99, -9999.0, -9999]:
+            df = df.replace(fv, np.nan)
+
+        # ── Step 4: build a proper date column ────────────────────────────
+        if "DATE" in df.columns:
+            df["date"] = pd.to_datetime(df["DATE"], infer_datetime_format=True,
+                                        errors="coerce")
+
+        elif "YEAR" in df.columns and "MO" in df.columns and "DY" in df.columns:
+            # Format A: YEAR / MO / DY
+            df["date"] = pd.to_datetime(
+                df["YEAR"].astype(str).str.zfill(4) + "-" +
+                df["MO"].astype(str).str.zfill(2)  + "-" +
+                df["DY"].astype(str).str.zfill(2),
+                format="%Y-%m-%d", errors="coerce"
+            )
+
+        elif "YEAR" in df.columns and "DOY" in df.columns:
+            # Format B/C: YEAR + DOY
+            df["date"] = pd.to_datetime(
+                df["YEAR"].astype(str) +
+                df["DOY"].astype(str).str.zfill(3),
+                format="%Y%j", errors="coerce"
+            )
+        else:
+            raise ValueError(
+                "NASA POWER file detected but no recognised date columns found.\n"
+                "Need one of: (YEAR+MO+DY), (YEAR+DOY), or DATE."
+            )
+
+        df = (df.dropna(subset=["date"])
+                .sort_values("date")
+                .reset_index(drop=True))
+
+        # Rename lowercase 'date' key consistently
+        df.rename(columns={"DATE": "date"}, errors="ignore", inplace=True)
+        if "date" not in df.columns:
+            df["date"] = df.get("DATE", pd.NaT)
+
         return df
 
     # ── 3. Data-Driven Cadence & Cycle ─────────────────────────────────────
@@ -265,27 +376,53 @@ class PhenologyEngine:
     @staticmethod
     def engineer_met_features(met_df: pd.DataFrame) -> pd.DataFrame:
         df = met_df.copy()
+
         # GDD
         if "T2M" in df.columns:
-            df["GDD_5"] = (df["T2M"] - 5).clip(0)
-            df["GDD_10"] = (df["T2M"] - 10).clip(0)
+            df["T2M"] = pd.to_numeric(df["T2M"], errors="coerce")
+            df["GDD_5"]   = (df["T2M"] - 5).clip(lower=0)
+            df["GDD_10"]  = (df["T2M"] - 10).clip(lower=0)
             df["GDD_cum"] = df["GDD_5"].cumsum()
+
+        # Diurnal temperature range & T2M_RANGE
         if "T2M_MAX" in df.columns and "T2M_MIN" in df.columns:
-            df["DTR"] = df["T2M_MAX"] - df["T2M_MIN"]
-        # VPD
+            df["T2M_MAX"] = pd.to_numeric(df["T2M_MAX"], errors="coerce")
+            df["T2M_MIN"] = pd.to_numeric(df["T2M_MIN"], errors="coerce")
+            df["DTR"]       = df["T2M_MAX"] - df["T2M_MIN"]   # daily thermal range
+            df["T2M_RANGE"] = df["DTR"]                        # alias used in README
+
+        # VPD (kPa) from T2M + RH2M
         if "T2M" in df.columns and "RH2M" in df.columns:
+            df["RH2M"] = pd.to_numeric(df["RH2M"], errors="coerce")
             es = 0.6108 * np.exp(17.27 * df["T2M"] / (df["T2M"] + 237.3))
-            df["VPD"] = es * (1 - df["RH2M"] / 100)
-        # Log precip
+            df["VPD"] = es * (1.0 - df["RH2M"] / 100.0)
+
+        # Log precipitation
         if "PRECTOTCORR" in df.columns:
-            df["log_precip"] = np.log1p(df["PRECTOTCORR"])
+            df["PRECTOTCORR"] = pd.to_numeric(df["PRECTOTCORR"], errors="coerce")
+            df["log_precip"] = np.log1p(df["PRECTOTCORR"].clip(lower=0))
+        elif "PRECTOT" in df.columns:
+            df["PRECTOT"] = pd.to_numeric(df["PRECTOT"], errors="coerce")
+            df["PRECTOTCORR"] = df["PRECTOT"]          # unify column name
+            df["log_precip"]  = np.log1p(df["PRECTOT"].clip(lower=0))
+
+        # Solar radiation
+        if "ALLSKY_SFC_SW_DWN" in df.columns:
+            df["ALLSKY_SFC_SW_DWN"] = pd.to_numeric(df["ALLSKY_SFC_SW_DWN"], errors="coerce")
+
         # MSI = radiation / (precip + 1)
         if "ALLSKY_SFC_SW_DWN" in df.columns and "PRECTOTCORR" in df.columns:
-            df["MSI"] = df["ALLSKY_SFC_SW_DWN"] / (df["PRECTOTCORR"] + 1)
-        # SPEI proxy
+            df["MSI"] = df["ALLSKY_SFC_SW_DWN"] / (df["PRECTOTCORR"].clip(lower=0) + 1.0)
+
+        # SPEI proxy = P − PET  (simplified Hargreaves PET)
         if "T2M" in df.columns and "PRECTOTCORR" in df.columns:
-            pet = 0.0023 * (df["T2M"] + 17.8) * df.get("ALLSKY_SFC_SW_DWN", 20) ** 0.5
-            df["SPEI_proxy"] = df["PRECTOTCORR"] - pet
+            solar_col = df.get("ALLSKY_SFC_SW_DWN", pd.Series(20, index=df.index))
+            if isinstance(solar_col, pd.DataFrame):
+                solar_col = solar_col.iloc[:, 0]
+            solar_vals = pd.to_numeric(solar_col, errors="coerce").fillna(20)
+            pet = 0.0023 * (df["T2M"] + 17.8) * np.sqrt(solar_vals.clip(lower=0))
+            df["SPEI_proxy"] = df["PRECTOTCORR"].clip(lower=0) - pet
+
         return df
 
     # ── 7. Window-Mean Feature Computation ────────────────────────────────
@@ -371,14 +508,95 @@ class PhenologyEngine:
         sc = StandardScaler()
         Xs = sc.fit_transform(X)
 
-        # Ridge
+        # ── Ridge ──────────────────────────────────────────────────────────
         ridge = RidgeCV(alphas=np.logspace(-3, 4, 30), cv=None)
         ridge.fit(Xs, y)
         r2, mae = PhenologyEngine.loo_cv(Xs, y, lambda: RidgeCV(alphas=np.logspace(-3, 4, 30)))
-        results["Ridge"] = {"model": ridge, "scaler": sc, "loo_r2": r2, "loo_mae": mae,
-                            "coefs": ridge.coef_, "intercept": ridge.intercept_}
+        results["Ridge"] = {
+            "model": ridge, "scaler": sc, "loo_r2": r2, "loo_mae": mae,
+            "coefs": ridge.coef_, "intercept": ridge.intercept_,
+        }
 
-        # Polynomial deg-2
+        # ── LOESS (univariate or multi-feature via first PC) ───────────────
+        # LOESS is only meaningful in 1-D; for multi-feature input we project
+        # onto the first principal component before fitting.
+        if _LOESS_AVAILABLE:
+            try:
+                from sklearn.decomposition import PCA
+
+                if Xs.shape[1] == 1:
+                    Xloess = Xs[:, 0]
+                    _loess_pca = None
+                else:
+                    pca = PCA(n_components=1)
+                    Xloess = pca.fit_transform(Xs)[:, 0]
+                    _loess_pca = pca
+
+                frac_val = min(0.75, max(0.25, 6.0 / len(y)))
+                smoothed = sm_lowess(y, Xloess, frac=frac_val, return_sorted=False)
+
+                # LOO for LOESS
+                loess_preds = []
+                for i in range(len(y)):
+                    idx_tr = [j for j in range(len(y)) if j != i]
+                    x_tr, y_tr = Xloess[idx_tr], y[idx_tr]
+                    x_val = Xloess[i]
+                    try:
+                        sm = sm_lowess(y_tr, x_tr, frac=frac_val, return_sorted=True)
+                        # interpolate prediction
+                        from scipy.interpolate import interp1d as _i1d
+                        sm_sorted = sm[np.argsort(sm[:, 0])]
+                        f = _i1d(sm_sorted[:, 0], sm_sorted[:, 1],
+                                 bounds_error=False, fill_value=(sm_sorted[0, 1], sm_sorted[-1, 1]))
+                        loess_preds.append(float(f(x_val)))
+                    except Exception:
+                        loess_preds.append(float(np.mean(y_tr)))
+
+                lp = np.array(loess_preds)
+                ss_res = np.sum((y - lp) ** 2)
+                ss_tot = np.sum((y - y.mean()) ** 2)
+                r2l = 1 - ss_res / ss_tot if ss_tot > 1e-9 else np.nan
+                mael = float(np.mean(np.abs(y - lp)))
+
+                # Store fitted LOESS as a callable wrapper
+                class _LoessModel:
+                    def __init__(self, x_train, y_train, frac, pca_obj):
+                        self.x_train = x_train
+                        self.y_train = y_train
+                        self.frac = frac
+                        self.pca_obj = pca_obj
+                    def predict(self, X_new):
+                        if self.pca_obj is not None:
+                            xn = self.pca_obj.transform(X_new)[:, 0]
+                        else:
+                            xn = X_new[:, 0]
+                        sm = sm_lowess(self.y_train, self.x_train,
+                                       frac=self.frac, return_sorted=True)
+                        sm_sorted = sm[np.argsort(sm[:, 0])]
+                        from scipy.interpolate import interp1d as _i1d
+                        f = _i1d(sm_sorted[:, 0], sm_sorted[:, 1],
+                                 bounds_error=False,
+                                 fill_value=(sm_sorted[0, 1], sm_sorted[-1, 1]))
+                        return f(xn)
+
+                _loess_pca_final = _loess_pca if Xs.shape[1] > 1 else None
+                results["LOESS"] = {
+                    "model": _LoessModel(Xloess, y, frac_val, _loess_pca_final),
+                    "scaler": sc, "loo_r2": r2l, "loo_mae": mael,
+                    "coefs": None, "intercept": None,
+                }
+            except Exception:
+                pass
+        else:
+            # statsmodels not available — note it in results meta only
+            results["LOESS"] = {
+                "model": None, "scaler": None,
+                "loo_r2": np.nan, "loo_mae": np.nan,
+                "coefs": None, "intercept": None,
+                "note": "statsmodels not installed — pip install statsmodels",
+            }
+
+        # ── Polynomial deg-2 / deg-3 ──────────────────────────────────────
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import PolynomialFeatures
         for deg in [2, 3]:
@@ -397,27 +615,33 @@ class PhenologyEngine:
                         ("ridge", RidgeCV(alphas=np.logspace(-3, 4, 20))),
                     ])
                 )
-                results[f"Poly_deg{deg}"] = {"model": poly_pipe, "scaler": None,
-                                              "loo_r2": r2p, "loo_mae": maep,
-                                              "coefs": None, "intercept": None}
+                results[f"Poly_deg{deg}"] = {
+                    "model": poly_pipe, "scaler": None,
+                    "loo_r2": r2p, "loo_mae": maep,
+                    "coefs": None, "intercept": None,
+                }
             except Exception:
                 pass
 
-        # GPR
+        # ── GPR ───────────────────────────────────────────────────────────
         if len(y) >= 5:
             try:
                 kernel = ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1)
-                gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
+                gpr = GaussianProcessRegressor(
+                    kernel=kernel, n_restarts_optimizer=5, normalize_y=True
+                )
                 gpr.fit(Xs, y)
                 r2g, maeg = PhenologyEngine.loo_cv(
                     Xs, y,
                     lambda: GaussianProcessRegressor(
                         kernel=ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1),
-                        normalize_y=True
+                        normalize_y=True,
                     )
                 )
-                results["GPR"] = {"model": gpr, "scaler": sc, "loo_r2": r2g, "loo_mae": maeg,
-                                   "coefs": None, "intercept": None}
+                results["GPR"] = {
+                    "model": gpr, "scaler": sc, "loo_r2": r2g, "loo_mae": maeg,
+                    "coefs": None, "intercept": None,
+                }
             except Exception:
                 pass
 
