@@ -8,6 +8,26 @@
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" />
 </p>
 
+---
+
+<p align="center">
+
+  <!-- ▶ LIVE APP — one click to open the deployed Streamlit app -->
+  <a href="https://indian-forest-phenology-v6.streamlit.app/" target="_blank">
+    <img src="https://img.shields.io/badge/▶%20Open%20Live%20App-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" alt="Open Live App" />
+  </a>
+
+  &nbsp;&nbsp;
+
+  <!-- 🚀 DEPLOY YOUR OWN — one click to deploy a fresh copy on Streamlit Cloud -->
+  <a href="https://streamlit.io/deploy?repository=https://github.com/shreejisharma/Indian-forest-phenology&branch=main&mainModule=app/universal_Indian_forest_phenology_v6.py" target="_blank">
+    <img src="https://img.shields.io/badge/🚀%20Deploy%20Your%20Own-0068C8?style=for-the-badge&logo=streamlit&logoColor=white" alt="Deploy your own" />
+  </a>
+
+</p>
+
+---
+
 A **monsoon-aware, causally correct Streamlit application** for extracting and predicting phenological events — **Start of Season (SOS)**, **Peak of Season (POS)**, **End of Season (EOS)**, and **Length of Season (LOS)** — across all Indian forest types.
 
 > **Key upgrade from v5:** v5 always selected T2M as the dominant driver for every metric. This is **ecologically incorrect** for Indian monsoon forests where T2M varies by less than 1°C across seasons. v6 fixes this with monsoon-aware feature engineering, moisture protection, and variance-weighted feature ranking.
