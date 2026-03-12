@@ -462,8 +462,8 @@ def build_X_y(event_key, window_days):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TABS
 # ═══════════════════════════════════════════════════════════════════════════════
-tab_overview, tab_train, tab_corr, tab_predict, tab_guide = st.tabs([
-    "📊 Data Overview", "🔬 Training & Models", "📈 Correlations", "🔮 Predict 2026", "📖 Technical Guide"
+tab_overview, tab_train, tab_driver, tab_corr, tab_predict, tab_guide = st.tabs([
+    "📊 Data Overview", "🔬 Training & Models", "🎯 Driver Analysis", "📈 Correlations", "🔮 Predict 2026", "📖 Technical Guide"
 ])
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -639,6 +639,283 @@ with tab_train:
             st.download_button(f"⬇ Download {evt} results CSV", dl_df.to_csv(index=False),
                                file_name=f"phenology_{evt}_v6.csv", mime="text/csv")
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TAB 3 — DRIVER ANALYSIS  (ported from phenology_model.jsx)
+# Sensitivity analysis: ∂metric/∂factor for each phenological event × met variable
+# Mirrors the JSX: Driver Bar Chart, Sensitivity Heatmap, Factor Radar, 
+#                  Cross-metric dominance cards, and Dominant Driver summary
+# ───────────────────────────────────────────────────────────────────────────────
+with tab_driver:
+    st.subheader("🎯 Driver Analysis — Sensitivity & Factor Attribution")
+    st.caption("Shows how much each climate variable influences each phenological metric (∂DOY / ∂factor), ported from the interactive JSX model.")
+
+    if not model_store:
+        st.info("Train models first (Training & Models tab) to enable driver analysis.")
+    else:
+        # ── Compute numerical sensitivity: perturb each feature by +10%, measure ΔDOY ──
+        FACTOR_LABELS = {
+            "T2M":              "Temperature",
+            "PRECTOTCORR_sum":  "Precipitation",
+            "RH2M":             "Humidity",
+            "WS2M":             "Wind Speed",
+            "ALLSKY_SFC_SW_DWN":"Solar Radiation",
+            "VPD":              "Vapour Pressure Deficit",
+            "SPEI_proxy":       "SPEI Moisture Index",
+            "DTR":              "Diurnal Temp Range",
+        }
+        METRIC_LABELS_D = {"SOS": "Start of Season", "POS": "Peak of Season", "EOS": "End of Season"}
+        EVENT_COLORS    = {"SOS": "#22c55e", "POS": "#f59e0b", "EOS": "#ef4444"}
+        FACTOR_COLORS   = {
+            "T2M": "#FF6B35", "PRECTOTCORR_sum": "#4A90D9", "RH2M": "#52C41A",
+            "WS2M": "#9B59B6", "ALLSKY_SFC_SW_DWN": "#F5C518",
+            "VPD": "#E74C3C", "SPEI_proxy": "#1ABC9C", "DTR": "#E67E22",
+        }
+
+        def compute_sensitivity(info):
+            """Numerical perturbation: perturb each selected feature by +10%, compute ΔDOY."""
+            mdl       = info["model"]
+            sc        = info["scaler"]
+            feat_sel  = info["features"]
+            feat_all  = info["feat_names"]
+            X_tr      = info["X"]
+            sens      = {}
+            # Base prediction = mean of training inputs
+            base_vec  = np.array([[np.mean(X_tr[:, feat_all.index(f)]) for f in feat_sel]])
+            base_pred = float(mdl.predict(sc.transform(base_vec))[0])
+            for f in feat_sel:
+                base_val = base_vec[0, feat_sel.index(f)]
+                delta    = abs(base_val) * 0.10 + 0.01   # 10% perturbation
+                pert_vec = base_vec.copy()
+                pert_vec[0, feat_sel.index(f)] += delta
+                pert_pred = float(mdl.predict(sc.transform(pert_vec))[0])
+                # Sensitivity = ΔDOY per unit change (normalised as %DOY per %factor)
+                pct_change_factor = delta / (abs(base_val) + 1e-9) * 100
+                pct_change_doy    = (pert_pred - base_pred) / (abs(base_pred) + 1e-9) * 100
+                sens[f] = round(pct_change_doy / pct_change_factor * 100, 2)  # %DOY per 1% factor
+            return sens, base_pred
+
+        # Build sensitivity matrix: events × features
+        sens_matrix = {}
+        base_preds  = {}
+        all_features_used = set()
+        for evt, info in model_store.items():
+            s, bp = compute_sensitivity(info)
+            sens_matrix[evt] = s
+            base_preds[evt]  = bp
+            all_features_used.update(s.keys())
+
+        all_features_used = sorted(all_features_used)
+
+        # ── Select metric to explore ──
+        active_metric = st.selectbox(
+            "Select phenological metric to analyse",
+            list(model_store.keys()),
+            format_func=lambda x: f"{x} — {METRIC_LABELS_D.get(x, x)}",
+        )
+        sens_for_metric = sens_matrix.get(active_metric, {})
+
+        # ── Layout: 3 columns ──
+        col_bar, col_radar, col_dom = st.columns([2, 2, 1])
+
+        # ── 1. Driver Bar Chart (like JSX Tab 2) ──
+        with col_bar:
+            st.markdown(f"##### Sensitivity of **{METRIC_LABELS_D.get(active_metric, active_metric)}** to each factor")
+            st.caption("% change in DOY per 1% increase in factor")
+            if sens_for_metric:
+                bar_feats = sorted(sens_for_metric.items(), key=lambda x: -abs(x[1]))
+                feat_names_bar = [FACTOR_LABELS.get(f, f) for f, _ in bar_feats]
+                sens_vals      = [v for _, v in bar_feats]
+                colors_bar     = [FACTOR_COLORS.get(f, "#888") for f, _ in bar_feats]
+
+                fig_bar, ax_bar = plt.subplots(figsize=(6, max(3, len(bar_feats) * 0.6)))
+                bars = ax_bar.barh(feat_names_bar, sens_vals,
+                                   color=[c if v >= 0 else "#ef4444" for c, v in zip(colors_bar, sens_vals)],
+                                   alpha=0.85, edgecolor="white", linewidth=0.5)
+                ax_bar.axvline(0, color="black", lw=0.8)
+                ax_bar.set_xlabel("Sensitivity (%DOY / 1% factor change)", fontsize=9)
+                ax_bar.set_title(f"{active_metric} Driver Sensitivity", fontsize=10, fontweight="bold",
+                                 color=EVENT_COLORS.get(active_metric, "#333"))
+                for bar, val in zip(bars, sens_vals):
+                    ax_bar.text(val + (0.01 if val >= 0 else -0.01), bar.get_y() + bar.get_height()/2,
+                                f"{val:+.2f}", va="center", ha="left" if val >= 0 else "right", fontsize=8)
+                ax_bar.grid(axis="x", alpha=0.3); fig_bar.tight_layout()
+                st.pyplot(fig_bar); plt.close()
+
+                # Interpretation text (like JSX "Driver Interpretation")
+                st.markdown("**Top driver interpretation:**")
+                for i, (f, v) in enumerate(bar_feats[:3]):
+                    label = FACTOR_LABELS.get(f, f)
+                    metric_label = METRIC_LABELS_D.get(active_metric, active_metric).lower()
+                    direction = f"delays/extends **{metric_label}**" if v > 0 else f"advances **{metric_label}**"
+                    st.markdown(
+                        f"**{i+1}. {label}** — ↑ increasing {label.lower()} {direction} "
+                        f"by `{abs(v):.2f}%` per 1% unit increase",
+                        help=f"Numerical perturbation: +10% change in {f}"
+                    )
+            else:
+                st.info("No sensitivity data — feature may not be in selected model.")
+
+        # ── 2. Factor Radar (like JSX Tab 4) ──
+        with col_radar:
+            st.markdown(f"##### Factor influence magnitude on **{active_metric}**")
+            if sens_for_metric:
+                radar_labels = [FACTOR_LABELS.get(f, f) for f in sens_for_metric]
+                radar_vals   = [abs(v) for v in sens_for_metric.values()]
+                # Close the radar polygon
+                radar_vals_c   = radar_vals + [radar_vals[0]]
+                angles         = np.linspace(0, 2 * np.pi, len(radar_labels), endpoint=False).tolist()
+                angles_c       = angles + [angles[0]]
+
+                fig_rad, ax_rad = plt.subplots(figsize=(4.5, 4.5), subplot_kw=dict(polar=True))
+                ax_rad.fill(angles_c, radar_vals_c,
+                            alpha=0.25, color=EVENT_COLORS.get(active_metric, "#4A90D9"))
+                ax_rad.plot(angles_c, radar_vals_c, lw=2,
+                            color=EVENT_COLORS.get(active_metric, "#4A90D9"))
+                ax_rad.set_xticks(angles)
+                ax_rad.set_xticklabels(radar_labels, fontsize=8)
+                ax_rad.set_title(f"{active_metric} — Factor Radar", fontsize=10,
+                                 fontweight="bold", pad=18)
+                ax_rad.grid(True, alpha=0.3); fig_rad.tight_layout()
+                st.pyplot(fig_rad); plt.close()
+
+        # ── 3. Dominant driver card (like JSX left panel) ──
+        with col_dom:
+            st.markdown("##### Dominant Driver")
+            if sens_for_metric:
+                dom_feat, dom_val = max(sens_for_metric.items(), key=lambda x: abs(x[1]))
+                dom_label  = FACTOR_LABELS.get(dom_feat, dom_feat)
+                dom_color  = FACTOR_COLORS.get(dom_feat, "#888")
+                direction_word = "delays ↑" if dom_val > 0 else "advances ↓"
+                st.markdown(f"""
+<div style="background:#f0f9ff;border:2px solid {dom_color};border-radius:12px;padding:16px;text-align:center;">
+  <div style="font-size:11px;color:#666;margin-bottom:6px">for {METRIC_LABELS_D.get(active_metric, active_metric)}</div>
+  <div style="font-size:20px;font-weight:700;color:{dom_color}">{dom_label}</div>
+  <div style="font-size:13px;margin-top:8px;color:#444">{direction_word}</div>
+  <div style="font-size:22px;font-weight:800;color:{dom_color};margin-top:4px">{abs(dom_val):.2f}%</div>
+  <div style="font-size:10px;color:#888">per 1% unit increase</div>
+</div>
+""", unsafe_allow_html=True)
+
+                # All events dominant driver
+                st.markdown("---")
+                st.markdown("**Dominant driver per event:**")
+                for evt, s_dict in sens_matrix.items():
+                    if s_dict:
+                        top_f, top_v = max(s_dict.items(), key=lambda x: abs(x[1]))
+                        top_lbl   = FACTOR_LABELS.get(top_f, top_f)
+                        top_color = FACTOR_COLORS.get(top_f, "#888")
+                        st.markdown(
+                            f'<div style="background:#f8f8f8;border-left:4px solid {EVENT_COLORS.get(evt,"#888")};'
+                            f'border-radius:6px;padding:8px 10px;margin-bottom:6px">'
+                            f'<b style="color:{EVENT_COLORS.get(evt,"#333")}">{evt}</b><br>'
+                            f'<span style="color:{top_color};font-weight:600">{top_lbl}</span>'
+                            f'<span style="color:#888;font-size:11px"> ({top_v:+.2f}%)</span></div>',
+                            unsafe_allow_html=True
+                        )
+
+        # ── 4. Full Sensitivity Heatmap (like JSX Tab 3) ──
+        st.markdown("---")
+        st.markdown("### 🔥 Full Sensitivity Heatmap — All Events × All Features")
+        st.caption("Each cell = % change in event DOY per 1% increase in that climate variable. Red = delays event, Blue = advances event.")
+
+        # Collect all features across all events for unified table
+        all_feats_heat = []
+        for evt in model_store:
+            for f in sens_matrix.get(evt, {}):
+                if f not in all_feats_heat:
+                    all_feats_heat.append(f)
+
+        if all_feats_heat:
+            heat_data = []
+            for f in all_feats_heat:
+                row = {"Climate Variable": FACTOR_LABELS.get(f, f)}
+                for evt in ["SOS", "POS", "EOS"]:
+                    row[evt] = sens_matrix.get(evt, {}).get(f, None)
+                heat_data.append(row)
+            heat_df = pd.DataFrame(heat_data).set_index("Climate Variable")
+
+            # Color the heatmap
+            def heat_style(val):
+                if val is None or np.isnan(float(val) if val is not None else np.nan):
+                    return "background-color: #f5f5f5; color: #ccc"
+                v = float(val)
+                max_abs = max(
+                    max((abs(v2) for row in heat_data for k, v2 in row.items() if k != "Climate Variable" and v2 is not None), default=1),
+                    0.01
+                )
+                norm = v / max_abs
+                if norm > 0:
+                    intensity = int(norm * 180)
+                    return f"background-color: rgb(255,{255-intensity},{255-intensity}); color: {'#500' if intensity>100 else '#333'}"
+                else:
+                    intensity = int(abs(norm) * 180)
+                    return f"background-color: rgb({255-intensity},{255-intensity},255); color: {'#005' if intensity>100 else '#333'}"
+
+            styled = heat_df.style.applymap(heat_style).format(
+                lambda v: f"{v:+.2f}%" if v is not None and not (isinstance(v, float) and np.isnan(v)) else "—"
+            )
+            st.dataframe(styled, use_container_width=True)
+
+            # Legend
+            st.markdown("""
+<div style="display:flex;gap:24px;font-size:12px;margin-top:6px">
+  <span><span style="background:rgb(255,75,75);padding:2px 10px;border-radius:3px">&nbsp;</span> &nbsp;Delays event (positive)</span>
+  <span><span style="background:rgb(75,75,255);padding:2px 10px;border-radius:3px">&nbsp;</span> &nbsp;Advances event (negative)</span>
+  <span><span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 10px;border-radius:3px">—</span> &nbsp;Feature not in this event's model</span>
+</div>
+""", unsafe_allow_html=True)
+
+        # ── 5. Cross-metric driver dominance cards (like JSX radar bottom grid) ──
+        st.markdown("---")
+        st.markdown("### 🃏 Cross-Metric Driver Dominance")
+        st.caption("Which climate variable has the strongest influence on each phenological event?")
+        card_cols = st.columns(len(model_store))
+        for col_c, (evt, s_dict) in zip(card_cols, sens_matrix.items()):
+            with col_c:
+                if s_dict:
+                    sorted_drivers = sorted(s_dict.items(), key=lambda x: -abs(x[1]))
+                    dom_f, dom_v   = sorted_drivers[0]
+                    dom_lbl = FACTOR_LABELS.get(dom_f, dom_f)
+                    dom_col = FACTOR_COLORS.get(dom_f, "#888")
+                    evt_col = EVENT_COLORS.get(evt, "#333")
+                    st.markdown(f"""
+<div style="border:2px solid {evt_col};border-radius:10px;padding:14px;text-align:center;margin-bottom:8px">
+  <div style="font-size:18px;font-weight:800;color:{evt_col}">{evt}</div>
+  <div style="font-size:11px;color:#888;margin-bottom:8px">{METRIC_LABELS_D.get(evt,'')}</div>
+  <div style="font-size:15px;font-weight:700;color:{dom_col}">{dom_lbl}</div>
+  <div style="font-size:12px;color:#666;margin-top:4px">{abs(dom_v):.2f}% sensitivity</div>
+</div>
+""", unsafe_allow_html=True)
+                    # Show all ranked drivers for this event
+                    for rank, (f, v) in enumerate(sorted_drivers):
+                        lbl = FACTOR_LABELS.get(f, f)
+                        fc  = FACTOR_COLORS.get(f, "#888")
+                        bar_w = int(abs(v) / (abs(sorted_drivers[0][1]) + 1e-9) * 100)
+                        st.markdown(
+                            f'<div style="font-size:11px;margin-bottom:3px">'
+                            f'<span style="color:{fc};font-weight:600">{rank+1}. {lbl}</span>'
+                            f'<span style="color:#999"> {v:+.2f}%</span>'
+                            f'<div style="background:{fc};height:4px;width:{bar_w}%;border-radius:2px;opacity:0.6;margin-top:2px"></div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+        # ── Download sensitivity table ──
+        st.markdown("---")
+        if all_feats_heat:
+            heat_dl = pd.DataFrame([
+                {"Feature": FACTOR_LABELS.get(f, f),
+                 **{evt: sens_matrix.get(evt, {}).get(f, None) for evt in ["SOS","POS","EOS"]}}
+                for f in all_feats_heat
+            ])
+            st.download_button(
+                "⬇ Download sensitivity matrix CSV",
+                heat_dl.to_csv(index=False),
+                file_name="driver_sensitivity_v6.csv",
+                mime="text/csv"
+            )
+
 # ───────────────────────────────────────────────────────────────────────────────
 # TAB 3 — CORRELATIONS
 # ───────────────────────────────────────────────────────────────────────────────
@@ -766,7 +1043,7 @@ In v5, **T2M always dominated** every phenological metric. Here's why this is wr
 | Issue | v5 Behaviour | v6 Fix |
 |-------|-------------|--------|
 | T2M variation | 24.15–24.82°C (< 0.7°C range) | Variance-weighted ranking — low-CV features down-ranked |
-| PRECTOTCORR dropped | Dropped because \|r\| > 0.85 with T2M | Moisture protection flag — PRECTOTCORR/RH2M survive collinearity filter |
+| PRECTOTCORR dropped | Dropped because |r| > 0.85 with T2M | Moisture protection flag — PRECTOTCORR/RH2M survive collinearity filter |
 | GDD_cum leakage | Used as predictor | Excluded from forward selection (leakage guard) |
 | Short windows | 30d default misses monsoon signal | 60/90d default for SOS |
 | Precipitation = mean | Mean of 5-day totals | Sum = actual accumulation (physically correct) |
@@ -794,7 +1071,7 @@ In v5, **T2M always dominated** every phenological metric. Here's why this is wr
 ---
 
 ### 📐 Feature Selection Algorithm (v6)
-1. Compute Pearson \|r\| + Spearman \|ρ\| composite
+1. Compute Pearson |r| + Spearman |ρ| composite
 2. **Variance weight**: if CV < 2%, composite × 0.5 (down-ranks T2M etc.)
 3. **Leakage exclusion**: GDD_cum excluded from candidate set
 4. **Collinearity filter** with moisture protection:
